@@ -1,0 +1,5 @@
+phase,component,workload,topology,calls,avg_latency_us,flops_per_call_g,achieved_tflops,mfu_pct,traffic_lower_bound_gb,effective_bandwidth_gbps,bandwidth_util_pct
+prefill,attention_c4,prefill_q8192_b1,attention_tp2_dp4_moe_tp8,30,7455.167,961.125,128.921,93.296,4.224,566.546,13.249
+prefill,attention_c4,prefill_q4096_b1,attention_tp2_dp4_moe_tp8,30,2914.016,343.597,117.912,85.33,1.51,518.168,12.117
+prefill,attention_c128,prefill_q8192_b1,attention_tp2_dp4_moe_tp8,31,2316.29,171.245,73.931,53.502,0.753,324.891,7.598
+prefill,attention_c128,prefill_q4096_b1,attention_tp2_dp4_moe_tp8,31,1162.481,77.309,66.504,48.127,0.34,292.253,6.834

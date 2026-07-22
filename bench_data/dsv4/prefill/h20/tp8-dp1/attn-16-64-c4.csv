@@ -1,0 +1,2 @@
+dtype,s_q,s_kv,latency_us,mfu
+bf16,4096,5120,2912.725,0.21342
