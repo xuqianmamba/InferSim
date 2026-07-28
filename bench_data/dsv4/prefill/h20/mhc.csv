@@ -1,0 +1,2 @@
+architecture_fingerprint,tp_size,backend,attention_weight_dtype,batch_size,q_len,mode,latency_us
+dc8a15770f7f8647,8,dsv4,fp8,1,4096,fused_post_pre,778.451410

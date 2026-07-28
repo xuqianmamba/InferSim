@@ -1,0 +1,2 @@
+architecture_fingerprint,tp_size,world_size,num_nodes,backend,expert_weight_dtype,batch_size,q_len,latency_us
+2a60524de4a88a10,16,16,2,flashinfer_mxfp4,fp4,1,8,5

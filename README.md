@@ -21,7 +21,8 @@ The accuracy of simulation results relies heavily on the kernel benchmark result
 
 ## Supported Features
 
-- **Attention**: MHA/GQA, MLA. Benchmarked on FlashInfer, FlashAttention-3, FlashMLA.
+- **Attention**: MHA/GQA, MLA, and table-driven DeepSeek-V4 C4/C128
+  compressed MQA. Benchmarked on FlashInfer, FlashAttention-3, FlashMLA.
 - **MoE**: GroupedGEMM. Benchmarked on DeepGEMM.
 - **Linear**: GEMM. Benchmarked on DeepGEMM.
 - **Parallelization**: DP Attn, EP MoE.

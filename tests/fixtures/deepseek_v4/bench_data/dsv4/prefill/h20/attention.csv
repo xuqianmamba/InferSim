@@ -1,0 +1,3 @@
+architecture_fingerprint,tp_size,backend,attention_weight_dtype,kv_dtype,compress_state_dtype,ratio,batch_size,q_len,past_len,latency_us
+2a60524de4a88a10,16,dsv4,fp8,fp8_e4m3,fp32,128,1,8,0,10
+2a60524de4a88a10,16,dsv4,fp8,fp8_e4m3,fp32,4,1,8,0,20

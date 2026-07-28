@@ -1,6 +1,8 @@
 import argparse
 
 from config.model_config import ModelConfig
+from kernel_sim.dsv4 import canonical_dsv4_kv_dtype
+from models.deepseek_v4_model import DeepSeekV4Model
 from models.hybrid_model import HybridModel
 from models.model import Model
 
@@ -15,16 +17,16 @@ def mfu_value(value):
 def non_negative_float(value):
     value = float(value)
     if not 0 <= value < float("inf"):
-        raise argparse.ArgumentTypeError("value must be finite and greater than or equal to 0")
+        raise argparse.ArgumentTypeError(
+            "value must be finite and greater than or equal to 0"
+        )
     return value
 
 
 def main(args):
     config = ModelConfig(args.config_path)
 
-    enable_shared_expert_overlap = getattr(
-        args, "enable_shared_expert_overlap", False
-    )
+    enable_shared_expert_overlap = getattr(args, "enable_shared_expert_overlap", False)
     if enable_shared_expert_overlap and not (
         config.is_qwen3_5_moe and config.is_hybrid_linear
     ):
@@ -38,8 +40,27 @@ def main(args):
     print("{:<40} {:<10}".format("World size:", args.world_size))
     print("{:<40} {:<10}".format("TP size:", args.tp_size))
     print("{:<40} {:<10}".format("Attn type:", config.attn_type))
-    print("{:<40} {:<10}".format("Use FP8 GEMM:", args.use_fp8_gemm))
-    print("{:<40} {:<10}".format("Use FP8 KV:", args.use_fp8_kv))
+    if config.is_deepseek_v4:
+        print(
+            "{:<40} {:<10}".format(
+                "V4 attention weight dtype:",
+                args.dsv4_attention_weight_dtype or config.attention_weight_dtype,
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "V4 expert weight dtype:",
+                args.dsv4_expert_weight_dtype or config.expert_dtype,
+            )
+        )
+        print(
+            "{:<40} {:<10}".format(
+                "V4 KV dtype:", canonical_dsv4_kv_dtype(args.dsv4_kv_dtype)
+            )
+        )
+    else:
+        print("{:<40} {:<10}".format("Use FP8 GEMM:", args.use_fp8_gemm))
+        print("{:<40} {:<10}".format("Use FP8 KV:", args.use_fp8_kv))
     if config.is_qwen3_5_moe and config.is_hybrid_linear:
         print(
             "{:<40} {:<10}".format(
@@ -47,7 +68,10 @@ def main(args):
             )
         )
 
-    if config.is_hybrid_linear:
+    if config.is_deepseek_v4:
+        model = DeepSeekV4Model(args, config)
+        print("{:<40} {:<10}".format("Model type: ", "DeepSeekV4Model"))
+    elif config.is_hybrid_linear:
         model = HybridModel(args, config)
         print("{:<40} {:<10}".format("Model type: ", "HybridModel"))
     else:
@@ -153,6 +177,69 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--decode-only", action="store_true", help="Only simulate decoding"
+    )
+    parser.add_argument(
+        "--dsv4-bench-data-dir",
+        type=str,
+        default=None,
+        help=("DeepSeek-V4 benchmark root. Defaults to bench_data/dsv4."),
+    )
+    parser.add_argument(
+        "--dsv4-attn-backend",
+        type=str,
+        default="dsv4",
+        help="Attention backend key recorded in the V4 CSVs.",
+    )
+    parser.add_argument(
+        "--dsv4-moe-backend",
+        type=str,
+        default="flashinfer_mxfp4",
+        help="Resolved MoE runner key recorded in the V4 CSVs.",
+    )
+    parser.add_argument(
+        "--dsv4-attention-weight-dtype",
+        choices=["fp8", "bf16"],
+        default=None,
+        help="V4 attention weight dtype. Defaults to the model config.",
+    )
+    parser.add_argument(
+        "--dsv4-expert-weight-dtype",
+        choices=["fp4", "fp8", "bf16"],
+        default=None,
+        help="V4 expert weight dtype. Defaults to the model config.",
+    )
+    parser.add_argument(
+        "--dsv4-kv-dtype",
+        choices=["fp8_e4m3", "fp8", "bf16", "bfloat16"],
+        default="fp8_e4m3",
+        help="KV-cache dtype key recorded in the V4 attention CSV.",
+    )
+    parser.add_argument(
+        "--dsv4-compress-state-dtype",
+        choices=["fp32", "bf16"],
+        default="fp32",
+        help="Compression-state dtype key recorded in the V4 attention CSV.",
+    )
+    parser.add_argument(
+        "--dsv4-mhc-mode",
+        type=str,
+        default="fused_post_pre",
+        help="mHC execution-mode key recorded in the V4 CSV.",
+    )
+    parser.add_argument(
+        "--dsv4-prefill-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Prefill request batch size. Defaults to "
+            "ceil(max-prefill-tokens / target-isl)."
+        ),
+    )
+    parser.add_argument(
+        "--dsv4-decode-past-len",
+        type=int,
+        default=None,
+        help="Decode past length used for exact V4 CSV lookup.",
     )
     args = parser.parse_args()
     main(args)
