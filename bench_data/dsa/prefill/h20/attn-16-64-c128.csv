@@ -1,2 +1,0 @@
-dtype,s_q,s_kv,latency_us,mfu
-bf16,4096,4128,1163.779,0.12018

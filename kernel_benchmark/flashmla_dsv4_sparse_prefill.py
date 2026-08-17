@@ -12,7 +12,7 @@ import statistics
 from pathlib import Path
 
 CSV_FIELDS = ("dtype", "s_q", "s_kv", "latency_us", "mfu")
-ATTENTION_COMPUTE_HEAD_DIM = 64
+DSV4_ATTENTION_HEAD_DIM = 512
 
 
 def load_shape(config_path: Path, tp_size: int) -> dict[str, int]:
@@ -20,14 +20,20 @@ def load_shape(config_path: Path, tp_size: int) -> dict[str, int]:
         config_path = config_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     num_heads = int(config["num_attention_heads"])
+    head_dim = int(config["head_dim"])
     if num_heads % tp_size:
         raise ValueError("num_attention_heads must be divisible by tp_size")
+    if head_dim != DSV4_ATTENTION_HEAD_DIM:
+        raise ValueError(
+            "This benchmark targets DeepSeek-V4 with a 512-wide attention "
+            f"head, but config head_dim is {head_dim}"
+        )
     return {
         "num_heads": num_heads // tp_size,
-        # The DSV4 sparse attention core computes 64 elements per head.
-        # This is deliberately not the wider pre-attention projection size.
-        "head_dim": ATTENTION_COMPUTE_HEAD_DIM,
-        "value_dim": ATTENTION_COMPUTE_HEAD_DIM,
+        # DeepSeek-V4 head_dim is the complete QK width: 448 NoPE + 64 RoPE.
+        # FlashMLA sparse prefill receives this full width, not only RoPE.
+        "head_dim": head_dim,
+        "value_dim": head_dim,
         "sliding_window": int(config.get("sliding_window", 128)),
         "index_topk": int(config.get("index_topk", 1024)),
     }
@@ -102,6 +108,10 @@ def main() -> None:
         dtype=torch.bfloat16,
         device=device,
     )
+    if q.shape[-1] != DSV4_ATTENTION_HEAD_DIM:
+        raise AssertionError(f"unexpected Q head dimension: {q.shape[-1]}")
+    if kv.shape[-1] != DSV4_ATTENTION_HEAD_DIM:
+        raise AssertionError(f"unexpected KV head dimension: {kv.shape[-1]}")
 
     # Entries beyond each query's causal valid length are ignored by the
     # combiner.  The deterministic pattern keeps every consumed index valid.
@@ -149,14 +159,14 @@ def main() -> None:
         4
         * q_len
         * shape["num_heads"]
-        * ATTENTION_COMPUTE_HEAD_DIM
+        * shape["head_dim"]
         * mean_keys
     )
     achieved_tflops = flops / latency_us / 1e6
     # Follow the existing bench_data attention schema. s_kv is the physical
-    # KV workspace length. The file name records local heads, the 64-element
+    # KV workspace length. The file name records local heads, the 512-element
     # compute dimension and the compression group, for example
-    # attn-64-64-c4.csv for attention TP2.
+    # attn-64-512-c4.csv for attention TP2.
     row = {
         "dtype": "bf16",
         "s_q": q_len,
