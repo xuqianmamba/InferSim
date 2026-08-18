@@ -92,12 +92,16 @@ def benchmark_point(
     weights = torch.randn(
         batch, shape["index_heads"], dtype=torch.float32, device="cuda"
     )
+    # SGLang keeps the logical C4 lengths one-dimensional for the top-k
+    # transform, but DeepGEMM's paged-MQA scheduler/kernel requires a
+    # (num_queries, next_n) layout. Decode has next_n=1.
     lengths = torch.full((batch,), c4_len, dtype=torch.int32, device="cuda")
+    lengths_2d = lengths.unsqueeze(-1)
     page_table = torch.arange(total_blocks, dtype=torch.int32, device="cuda").view(
         batch, blocks_per_request
     )
     metadata = deep_gemm.get_paged_mqa_logits_metadata(
-        lengths, block_size, deep_gemm.get_num_sms()
+        lengths_2d, block_size, deep_gemm.get_num_sms()
     )
 
     def run_logits():
@@ -105,7 +109,7 @@ def benchmark_point(
             q,
             cache,
             weights,
-            lengths,
+            lengths_2d,
             page_table,
             metadata,
             max_c4_len,
