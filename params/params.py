@@ -68,11 +68,27 @@ def get_gdn_params_size(config: ModelConfig, use_fp8: bool, tp_size: int):
     return 2 * s + wconv
 
 
+def get_dsa_params_size(config: ModelConfig, use_fp8: bool, tp_size: int):
+    local_heads = config.num_attention_heads // tp_size
+    params = (
+        config.hidden_size * config.q_lora_rank
+        + config.q_lora_rank * local_heads * config.head_dim
+        + config.hidden_size * config.head_dim
+        + local_heads * config.v_head_dim * config.o_lora_rank
+        + config.o_lora_rank * config.hidden_size
+        + config.q_lora_rank * config.index_n_heads * config.index_head_dim
+        + config.hidden_size * config.index_head_dim
+    )
+    return params if use_fp8 else 2 * params
+
+
 def get_attn_params_size(config: ModelConfig, use_fp8: bool, tp_size: int):
     if config.attn_type == "MHA/GQA":
         return get_mha_params_size(config, use_fp8, tp_size)
     elif config.attn_type == "MLA":
         return get_mla_params_size(config, use_fp8, tp_size)
+    elif config.attn_type == "DSA":
+        return get_dsa_params_size(config, use_fp8, tp_size)
 
 
 def get_linear_attn_params_size(config: ModelConfig, use_fp8: bool, tp_size: int):
@@ -83,9 +99,13 @@ def get_expert_params_size(config: ModelConfig, use_fp8: bool, tp_size: int):
     # TP shards intermediate_size; hidden_size is NOT sharded
     tp_intermediate_size = config.intermediate_size // tp_size
     w = 3 * config.hidden_size * tp_intermediate_size
-    if not use_fp8:
-        w *= 2
-    return w
+    if str(getattr(config, "expert_dtype", "")).lower() in {
+        "fp4",
+        "mxfp4",
+        "nvfp4",
+    }:
+        return w / 2
+    return w if use_fp8 else w * 2
 
 
 def load_attn_weights_time(config: ModelConfig, use_fp8: bool, gpu: GPU, tp_size: int):

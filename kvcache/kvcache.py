@@ -22,11 +22,24 @@ def get_mla_kvcache_size(config: ModelConfig, use_fp8):
     return kvcache_size
 
 
+def get_dsa_kvcache_size(config: ModelConfig, use_fp8):
+    # Long-context steady-state approximation.  Each C4/C128 layer stores a
+    # compressed 512-wide vector every ratio tokens; C1 stores every token.
+    elements = 0.0
+    for ratio, count in config.compress_ratio_counts.items():
+        elements += count * config.head_dim / (ratio or 1)
+    if not use_fp8:
+        elements *= 2
+    return elements
+
+
 def get_kvcache_size(config: ModelConfig, use_fp8, tp_size: int):
     if config.attn_type == "MHA/GQA":
         return get_mha_kvcache_size(config, use_fp8, tp_size)
     elif config.attn_type == "MLA":
         return get_mla_kvcache_size(config, use_fp8)
+    elif config.attn_type == "DSA":
+        return get_dsa_kvcache_size(config, use_fp8)
 
 
 def get_states_size(config: ModelConfig):

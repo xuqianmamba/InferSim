@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 
 class ModelConfig:
@@ -22,6 +23,7 @@ class ModelConfig:
 
         self.hidden_size = d["hidden_size"]
         self.num_hidden_layers = d["num_hidden_layers"]
+        self.expert_dtype = d.get("expert_dtype")
 
         # Non-hybrid models use full attention in every hidden layer.
         self.num_full_attn_layers = self.num_hidden_layers
@@ -40,8 +42,14 @@ class ModelConfig:
             self.linear_value_head_dim = d["linear_value_head_dim"]
             self.linear_num_value_heads = d["linear_num_value_heads"]
 
+        self.is_dsv4 = bool(d.get("compress_ratios")) or any(
+            "DeepseekV4" in architecture
+            for architecture in d.get("architectures", [])
+        )
         self.attn_type = "MHA/GQA"
-        if "kv_lora_rank" in d:
+        if self.is_dsv4:
+            self.attn_type = "DSA"
+        elif "kv_lora_rank" in d:
             self.attn_type = "MLA"
 
         # attn
@@ -62,11 +70,41 @@ class ModelConfig:
             self.v_head_dim = d["v_head_dim"]
             self.index_topk = d.get("index_topk")
             self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        elif self.attn_type == "DSA":
+            # DeepSeek-V4 stores the complete Q/K width in head_dim.  It
+            # already includes the RoPE component (448 NoPE + 64 RoPE = 512
+            # for V4-Pro); it must not be interpreted as 512 + 64.
+            self.num_attention_heads = d["num_attention_heads"]
+            self.num_key_value_heads = d.get("num_key_value_heads", 1)
+            self.head_dim = d["head_dim"]
+            self.qk_rope_head_dim = d["qk_rope_head_dim"]
+            self.qk_nope_head_dim = self.head_dim - self.qk_rope_head_dim
+            self.qk_head_dim = self.head_dim
+            self.v_head_dim = d.get("v_head_dim", self.head_dim)
+            self.q_lora_rank = d["q_lora_rank"]
+            self.o_lora_rank = d.get("o_lora_rank", self.hidden_size)
+            self.index_n_heads = d.get("index_n_heads", 64)
+            self.index_head_dim = d.get("index_head_dim", 128)
+            self.index_topk = d.get("index_topk", 1024)
+            self.swa_window = d.get("sliding_window", 128)
+            self.compress_ratios = tuple(d["compress_ratios"])
+            if len(self.compress_ratios) != self.num_hidden_layers:
+                raise ValueError(
+                    "compress_ratios must contain one entry per hidden layer"
+                )
+            unsupported = set(self.compress_ratios) - {0, 4, 128}
+            if unsupported:
+                raise ValueError(
+                    f"unsupported DeepSeek-V4 compression ratios: {unsupported}"
+                )
+            self.compress_ratio_counts = Counter(self.compress_ratios)
 
         # FFN/MoE
         self.is_moe = True
         if "num_routed_experts" in d:
             self.num_routed_experts = d["num_routed_experts"]
+        elif "n_routed_experts" in d:
+            self.num_routed_experts = d["n_routed_experts"]
         elif "num_experts" in d:
             self.num_routed_experts = d["num_experts"]
         else:
@@ -89,7 +127,9 @@ class ModelConfig:
                     self.shared_expert_intermediate_size // self.intermediate_size
                 )
             else:
-                self.num_shared_experts = d.get("num_shared_experts", 0)
+                self.num_shared_experts = d.get(
+                    "num_shared_experts", d.get("n_shared_experts", 0)
+                )
                 self.shared_expert_intermediate_size = (
                     self.num_shared_experts * self.intermediate_size
                 )

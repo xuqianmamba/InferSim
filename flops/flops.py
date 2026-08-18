@@ -109,6 +109,50 @@ def get_gqla_absorb_gflops(config, bs, avg_context_len):
     )
 
 
+def get_dsa_gflops(config, bs, avg_context_len, tp_size):
+    local_heads = config.num_attention_heads // tp_size
+    core = 0
+    for ratio, count in config.compress_ratio_counts.items():
+        if ratio == 0:
+            attended = avg_context_len
+        else:
+            compressed = max(avg_context_len // ratio, 1)
+            extra = min(config.index_topk, compressed) if ratio == 4 else compressed
+            attended = min(avg_context_len, config.swa_window) + extra
+        layer_core = (
+            bs
+            * local_heads
+            * 2
+            * attended
+            * (config.head_dim + config.v_head_dim)
+        )
+        if ratio == 4:
+            layer_core += (
+                2
+                * bs
+                * config.index_n_heads
+                * config.index_head_dim
+                * compressed
+            )
+        core += count * layer_core
+    core /= config.num_hidden_layers
+
+    q_down = gemm_flops(bs, config.hidden_size, config.q_lora_rank)
+    q_up = gemm_flops(bs, config.q_lora_rank, local_heads * config.head_dim)
+    kv_proj = gemm_flops(bs, config.hidden_size, config.head_dim)
+    o_down = gemm_flops(
+        bs, local_heads * config.v_head_dim, config.o_lora_rank
+    )
+    o_up = gemm_flops(bs, config.o_lora_rank, config.hidden_size)
+    index_q = gemm_flops(
+        bs,
+        config.q_lora_rank,
+        config.index_n_heads * config.index_head_dim,
+    )
+    index_k = gemm_flops(bs, config.hidden_size, config.index_head_dim)
+    others = q_down + q_up + kv_proj + o_down + o_up + index_q + index_k
+    return core / 1e9, others / 1e9
+
 def get_mla_noabsorb_gflops(config, bs, avg_context_len, tp_size):
     tp_num_heads = config.num_attention_heads // tp_size
     q_down_proj = gemm_flops(bs, config.hidden_size, config.q_lora_rank)
@@ -154,6 +198,10 @@ def get_attn_gflops(
                 config, bs=1, avg_context_len=avg_context_len, tp_size=tp_size
             )
         return get_mla_noabsorb_gflops(
+            config, bs=1, avg_context_len=avg_context_len, tp_size=tp_size
+        )
+    elif config.attn_type == "DSA":
+        return get_dsa_gflops(
             config, bs=1, avg_context_len=avg_context_len, tp_size=tp_size
         )
 

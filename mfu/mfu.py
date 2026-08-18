@@ -4,6 +4,99 @@ import os
 from hardware.gpu import gpu_map
 
 
+def _interpolate_exact_batch(
+    rows, target_bs, kv_len, bs_index, kv_index, latency_index, mfu_index
+):
+    """Interpolate latency/MFU along KV length for an exact batch size."""
+    same_bs = [row for row in rows if int(row[bs_index]) == target_bs]
+    if not same_bs:
+        return None
+    same_bs.sort(key=lambda row: int(row[kv_index]))
+    for row in same_bs:
+        if int(row[kv_index]) == kv_len:
+            return float(row[mfu_index]), float(row[latency_index]) / 1e6
+    lower = [row for row in same_bs if int(row[kv_index]) < kv_len]
+    upper = [row for row in same_bs if int(row[kv_index]) > kv_len]
+    if not lower or not upper:
+        return None
+    lo, hi = lower[-1], upper[0]
+    lo_kv, hi_kv = int(lo[kv_index]), int(hi[kv_index])
+    weight = (kv_len - lo_kv) / (hi_kv - lo_kv)
+    latency_us = float(lo[latency_index]) + weight * (
+        float(hi[latency_index]) - float(lo[latency_index])
+    )
+    mfu = float(lo[mfu_index]) + weight * (
+        float(hi[mfu_index]) - float(lo[mfu_index])
+    )
+    return mfu, latency_us / 1e6
+
+
+def get_dsa_decode_perf(
+    config, target_bs, kv_len, device_type, use_fp8_kv, tp_size, ratio
+):
+    """Return measured DSV4 sparse-attention performance.
+
+    SGLang's FlashMLA backend pads 1..64 local query heads to 64 and 65..128
+    to 128.  Latency therefore follows the padded-head benchmark, while the
+    returned MFU is scaled back to useful (unpadded) local heads.
+    """
+    local_heads = config.num_attention_heads // tp_size
+    if local_heads <= 64:
+        kernel_heads = 64
+    elif local_heads <= 128:
+        kernel_heads = 128
+    else:
+        kernel_heads = local_heads
+    file_name = (
+        f"bench_data/dsa/decode/{device_type.lower()}/"
+        f"attn-{kernel_heads}-{config.head_dim}-c{ratio}.csv"
+    )
+    if not os.path.exists(file_name):
+        print(f"Warning: {file_name} not exists")
+        return gpu_map[device_type].mfu, None
+    kv_dtype = "fp8" if use_fp8_kv else "bf16"
+    with open(file_name, newline="") as handle:
+        rows = [
+            row for row in csv.reader(handle)
+            if row and row[0] != "dtype" and row[1] == kv_dtype
+        ]
+    if not rows:
+        print(f"Warning: {file_name} has no {kv_dtype} rows")
+        return gpu_map[device_type].mfu, None
+    result = _interpolate_exact_batch(rows, target_bs, kv_len, 2, 3, 4, 5)
+    if result is None:
+        nearest = min(
+            rows,
+            key=lambda row: abs(int(row[2]) - target_bs)
+            + abs(int(row[3]) - kv_len) / max(kv_len, 1),
+        )
+        return float(nearest[5]) * local_heads / kernel_heads, None
+    mfu, latency = result
+    return round(mfu * local_heads / kernel_heads, 6), latency
+
+
+def get_dsa_indexer_decode_perf(config, target_bs, kv_len, device_type):
+    file_name = (
+        f"bench_data/dsa/decode/{device_type.lower()}/"
+        f"indexer-{config.index_n_heads}-{config.index_head_dim}-"
+        f"topk{config.index_topk}.csv"
+    )
+    if not os.path.exists(file_name):
+        print(f"Warning: {file_name} not exists")
+        return None, None
+    with open(file_name, newline="") as handle:
+        rows = [
+            row for row in csv.reader(handle)
+            if row and row[0] != "batch_size"
+        ]
+    # batch, original KV, compressed KV, logits, top-k, fused total, logits MFU
+    result = _interpolate_exact_batch(rows, target_bs, kv_len, 0, 1, 5, 6)
+    if result is None:
+        return None, None
+    mfu, latency = result
+    return round(mfu, 6), latency
+
+
 def get_attn_decode_mfu(config, target_bs, kv_len, device_type, use_fp8_kv, tp_size):
     mfu, _ = get_attn_decode_perf(
         config, target_bs, kv_len, device_type, use_fp8_kv, tp_size

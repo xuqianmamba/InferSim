@@ -12,6 +12,11 @@ from params.params import get_attn_params_size, get_expert_params_size
 class Model:
     def __init__(self, args, config):
         self.gpu = gpu_map[args.device_type]
+        self.gpu_memory_gb = (
+            args.gpu_memory_gb
+            if getattr(args, "gpu_memory_gb", None) is not None
+            else self.gpu.mem
+        )
         self.args = args
         self.config = config
 
@@ -51,7 +56,7 @@ class Model:
         params_per_gpu = params_per_gpu / 1024 / 1024 / 1024
         params_per_gpu *= self.config.num_hidden_layers
         self.kvcache_mem = (
-            self.gpu.mem - params_per_gpu - 15 - 5
+            self.gpu_memory_gb - params_per_gpu - 15 - 5
         )  # 15GB for runtime, 5GB for encoder
         print("{:<40} {:<10.2f}".format("Per GPU params size (GB):", params_per_gpu))
 

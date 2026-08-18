@@ -80,6 +80,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--world-size", type=int, default=1, help="Num of GPUs")
     parser.add_argument(
+        "--gpu-memory-gb",
+        type=float,
+        default=None,
+        help="Override per-GPU memory capacity (for example 141 for H20-141GB)",
+    )
+    parser.add_argument(
         "--tp-size",
         type=int,
         default=1,

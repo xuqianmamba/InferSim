@@ -21,7 +21,7 @@ The accuracy of simulation results relies heavily on the kernel benchmark result
 
 ## Supported Features
 
-- **Attention**: MHA/GQA, MLA. Benchmarked on FlashInfer, FlashAttention-3, FlashMLA.
+- **Attention**: MHA/GQA, MLA, DeepSeek-V4 DSA. Benchmarked on FlashInfer, FlashAttention-3, FlashMLA.
 - **MoE**: GroupedGEMM. Benchmarked on DeepGEMM.
 - **Linear**: GEMM. Benchmarked on DeepGEMM.
 - **Parallelization**: DP Attn, EP MoE.
@@ -93,6 +93,14 @@ optional arguments:
 ```
 
 ## Example
+
+DeepSeek-V4-Pro DSA decode uses measured H20 sparse-attention and indexer
+lookup tables. The remaining projection and MoE terms use InferSim's existing
+generic models.
+
+```bash
+bash example/deepseek-v4-pro/decode_h20_tp8.sh /path/to/config.json
+```
 
 ```
 $ bash example/qwen3-30B-A3B/decode.sh
