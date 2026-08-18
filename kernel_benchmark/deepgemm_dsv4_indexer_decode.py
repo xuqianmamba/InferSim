@@ -161,7 +161,7 @@ def main() -> None:
     kv_lens = parse_int_list(args.kv_lens)
     # attention TP does not change the replicated indexer, but loading the
     # model config through one validator keeps all DSV4 dimensions checked.
-    shape = load_dsv4_shape(args.config_path, attention_tp_size=2)
+    shape = load_dsv4_shape(args.config_path, attention_tp_size=8)
     if (shape["index_heads"], shape["index_dim"]) != (64, 128):
         raise SystemExit(
             f"expected DSV4 indexer shape (64, 128), got "

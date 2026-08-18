@@ -31,6 +31,23 @@ class DSV4BenchUtilsTest(unittest.TestCase):
         self.assertEqual(shape["head_dim"], 512)
         self.assertEqual(shape["index_heads"], 64)
 
+    def test_pro_tp8_dp1_has_16_logical_local_heads(self):
+        config = {
+            "num_attention_heads": 128,
+            "head_dim": 512,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 512,
+            "index_n_heads": 64,
+            "index_head_dim": 128,
+            "index_topk": 1024,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps(config), encoding="utf-8")
+            shape = load_dsv4_shape(path, attention_tp_size=8)
+        self.assertEqual(shape["local_heads"], 16)
+        self.assertEqual(shape["head_dim"], 512)
+
     def test_compressed_and_attended_lengths(self):
         self.assertEqual(compressed_length(40960, 4), 10240)
         self.assertEqual(compressed_length(40960, 128), 320)
