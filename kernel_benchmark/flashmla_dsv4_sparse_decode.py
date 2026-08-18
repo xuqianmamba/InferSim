@@ -1,8 +1,10 @@
-"""Benchmark the exact sparse-decode FlashMLA shape used by DeepSeek-V4.
+"""Benchmark the exact TP8DP1 sparse-decode FlashMLA call used by DeepSeek-V4.
 
-For TP8+DP4 attention DP, attention is TP2 and the local Q-head count is 64.
-Both the SWA cache and the compressed C4/C128 cache are passed to the same
-``flash_mla_with_kvcache`` call used by SGLang's DSV4 backend.
+TP8DP1 has 16 useful local query heads.  The production FlashMLA backend pads
+that shape to the kernel's minimum supported 64 query heads.  This benchmark
+therefore executes the 64-head kernel (the latency lookup key), while keeping
+the useful 16-head topology explicit in its diagnostic output.  InferSim
+scales the raw 64-head MFU back to 16 useful heads when it consumes the CSV.
 """
 
 from __future__ import annotations
@@ -105,6 +107,7 @@ def benchmark_point(
     repeats: int,
     warmup: int,
     peak_tflops: float,
+    kernel_heads: int,
 ):
     from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
@@ -112,12 +115,12 @@ def benchmark_point(
     q = torch.randn(
         batch,
         1,
-        shape["local_heads"],
+        kernel_heads,
         shape["head_dim"],
         dtype=torch.bfloat16,
         device="cuda",
     )
-    attn_sink = torch.randn(shape["local_heads"], dtype=torch.float32, device="cuda")
+    attn_sink = torch.randn(kernel_heads, dtype=torch.float32, device="cuda")
 
     swa_len, extra_len = attended_lengths(
         kv_len, ratio, shape["swa_window"], shape["index_topk"]
@@ -181,7 +184,7 @@ def benchmark_point(
     latency_us = sorted(samples)[len(samples) // 2]
     flops = attention_flops(
         batch,
-        shape["local_heads"],
+        kernel_heads,
         shape["head_dim"],
         shape["value_dim"],
         swa_len + selected_extra,
@@ -191,6 +194,8 @@ def benchmark_point(
         json.dumps(
             {
                 "ratio": ratio,
+                "logical_local_heads": shape["local_heads"],
+                "kernel_heads": kernel_heads,
                 "batch_size": batch,
                 "kv_len": kv_len,
                 "swa_tokens": swa_len,
@@ -213,7 +218,13 @@ def benchmark_point(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-path", required=True)
-    parser.add_argument("--attention-tp-size", type=int, default=2)
+    parser.add_argument("--attention-tp-size", type=int, default=8)
+    parser.add_argument(
+        "--kernel-query-heads",
+        type=int,
+        default=64,
+        help="Physical query-head count passed to FlashMLA after SGLang padding.",
+    )
     parser.add_argument("--batch-sizes", default="16,24,26,32")
     parser.add_argument("--kv-lens", default="16384,32768,40960,65536")
     parser.add_argument("--ratios", default="4,128")
@@ -229,10 +240,17 @@ def main() -> None:
     if any(ratio not in (4, 128) for ratio in ratios):
         raise SystemExit("--ratios supports only 4 and 128")
     shape = load_dsv4_shape(args.config_path, args.attention_tp_size)
-    if shape["local_heads"] not in (32, 64, 128):
+    kernel_heads = args.kernel_query_heads
+    if kernel_heads not in (32, 64, 128):
         raise SystemExit(
-            f"FlashMLA does not support local_heads={shape['local_heads']}"
+            f"FlashMLA does not support kernel_query_heads={kernel_heads}"
         )
+    if kernel_heads < shape["local_heads"]:
+        raise SystemExit(
+            f"kernel_query_heads={kernel_heads} is smaller than logical "
+            f"local_heads={shape['local_heads']}"
+        )
+    shape["kernel_heads"] = kernel_heads
     print("DSV4 shape:", json.dumps(shape, sort_keys=True))
     torch.set_default_device("cuda")
 
@@ -241,14 +259,21 @@ def main() -> None:
     for ratio in ratios:
         rows = [
             benchmark_point(
-                batch, kv_len, ratio, shape, args.repeats, args.warmup, args.bf16_tflops
+                batch,
+                kv_len,
+                ratio,
+                shape,
+                args.repeats,
+                args.warmup,
+                args.bf16_tflops,
+                kernel_heads,
             )
             for batch in batch_sizes
             for kv_len in kv_lens
         ]
         validate_matrix_rows(rows, batch_sizes, kv_lens)
         path = (
-            output_dir / f"attn-{shape['local_heads']}-{shape['head_dim']}-c{ratio}.csv"
+            output_dir / f"attn-{kernel_heads}-{shape['head_dim']}-c{ratio}.csv"
         )
         write_csv(path, fields, rows)
         print(f"Wrote {path}")
