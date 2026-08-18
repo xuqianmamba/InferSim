@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from dsv4_bench_utils import (
@@ -26,36 +27,56 @@ from dsv4_bench_utils import (
 )
 
 
-def quantize_k_cache(
-    input_cache: torch.Tensor, value_dim: int, tile_size: int = 128
+DSV4_NOPE_DIM = 448
+DSV4_ROPE_DIM = 64
+DSV4_SCALE_BYTES = 8  # Seven UE8M0 scales plus one padding byte.
+DSV4_KV_BYTES_PER_TOKEN = DSV4_NOPE_DIM + DSV4_ROPE_DIM * 2 + DSV4_SCALE_BYTES
+FLASHMLA_PAGE_ALIGNMENT = 576
+
+
+def make_dsv4_cache(
+    total_pages: int, block_size: int, head_dim: int
 ) -> torch.Tensor:
-    """Pack BF16 K/V into FlashMLA's per-128-value FP8 cache layout."""
-    assert value_dim % tile_size == 0
-    blocks, block_size, kv_heads, head_dim = input_cache.shape
-    assert kv_heads == 1
-    source = input_cache.squeeze(2)
-    tiles = value_dim // tile_size
-    packed = torch.empty(
-        (
-            blocks,
-            block_size,
-            value_dim + tiles * 4 + source.element_size() * (head_dim - value_dim),
-        ),
-        dtype=torch.float8_e4m3fn,
-        device=source.device,
+    """Build the exact packed DSV4 KV-cache view consumed by FlashMLA.
+
+    DSV4 does not use FlashMLA's generic FP8 cache layout.  It stores 448
+    NoPE values in FP8, 64 RoPE values in BF16, and eight scale/padding bytes
+    per token.  Reuse SGLang's production quantizer and page writer so this
+    standalone benchmark exercises the same 584-byte layout as serving.
+    """
+    from sglang.kernels.ops.attention.dsv4.index_buf_accessor import SetKAndS
+    from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
+        quant_to_nope_fp8_rope_bf16_pack_triton,
     )
-    values = packed[..., :value_dim]
-    scales = packed[..., value_dim : value_dim + tiles * 4].view(torch.float32)
-    rope = packed[..., value_dim + tiles * 4 :].view(source.dtype)
-    rope.copy_(source[..., value_dim:])
-    for tile in range(tiles):
-        part = source[..., tile * tile_size : (tile + 1) * tile_size]
-        scale = (part.abs().float().amax(dim=-1) / 448.0).clamp_min_(1e-8)
-        scales[..., tile] = scale
-        values[..., tile * tile_size : (tile + 1) * tile_size] = (
-            part.float() / scale.unsqueeze(-1)
-        ).to(torch.float8_e4m3fn)
-    return packed.view(blocks, block_size, 1, -1)
+
+    assert head_dim == DSV4_NOPE_DIM + DSV4_ROPE_DIM == 512
+    total_tokens = total_pages * block_size
+    source = (
+        torch.randn(total_tokens, head_dim, dtype=torch.bfloat16, device="cuda")
+        / 10
+    )
+    packed = quant_to_nope_fp8_rope_bf16_pack_triton(source)
+
+    page_bytes = block_size * DSV4_KV_BYTES_PER_TOKEN
+    padded_page_bytes = ceil_div(page_bytes, FLASHMLA_PAGE_ALIGNMENT) * 576
+    raw_cache = torch.zeros(
+        total_pages,
+        padded_page_bytes,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    locations = torch.arange(total_tokens, dtype=torch.int64, device="cuda")
+    SetKAndS.execute(
+        SimpleNamespace(page_size=block_size), raw_cache, locations, packed
+    )
+
+    # Match DeepseekV4AttnBackend: discard per-page tail padding, then expose
+    # the four-dimensional byte view expected by sparse_decode_fwd.
+    cache = raw_cache[:, :page_bytes].view(
+        total_pages, block_size, 1, DSV4_KV_BYTES_PER_TOKEN
+    )
+    assert cache.shape[-1] == 584
+    return cache
 
 
 def make_cache_and_indices(
@@ -63,13 +84,7 @@ def make_cache_and_indices(
 ):
     pages_per_request = ceil_div(logical_len, block_size)
     total_pages = batch * pages_per_request
-    source = (
-        torch.randn(
-            total_pages, block_size, 1, head_dim, dtype=torch.bfloat16, device="cuda"
-        )
-        / 10
-    )
-    cache = quantize_k_cache(source, head_dim)
+    cache = make_dsv4_cache(total_pages, block_size, head_dim)
     selected = logical_len
     padded = aligned_topk(selected)
     indices = torch.full((batch, 1, padded), -1, dtype=torch.int32, device="cuda")
@@ -116,18 +131,9 @@ def benchmark_point(
     extra_page = physical_page_size(ratio)
     pages_per_request = ceil_div(compressed, extra_page)
     total_pages = batch * pages_per_request
-    extra_source = (
-        torch.randn(
-            total_pages,
-            extra_page,
-            1,
-            shape["head_dim"],
-            dtype=torch.bfloat16,
-            device="cuda",
-        )
-        / 10
+    extra_cache = make_dsv4_cache(
+        total_pages, extra_page, shape["head_dim"]
     )
-    extra_cache = quantize_k_cache(extra_source, shape["value_dim"])
     extra_indices = torch.full(
         (batch, 1, aligned_topk(selected_extra)), -1, dtype=torch.int32, device="cuda"
     )
