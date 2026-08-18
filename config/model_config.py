@@ -87,16 +87,25 @@ class ModelConfig:
             self.index_head_dim = d.get("index_head_dim", 128)
             self.index_topk = d.get("index_topk", 1024)
             self.swa_window = d.get("sliding_window", 128)
-            self.compress_ratios = tuple(d["compress_ratios"])
-            if len(self.compress_ratios) != self.num_hidden_layers:
+            all_compress_ratios = tuple(d["compress_ratios"])
+            if len(all_compress_ratios) < self.num_hidden_layers:
                 raise ValueError(
-                    "compress_ratios must contain one entry per hidden layer"
+                    "compress_ratios has fewer entries than num_hidden_layers: "
+                    f"{len(all_compress_ratios)} < {self.num_hidden_layers}"
                 )
-            unsupported = set(self.compress_ratios) - {0, 4, 128}
+            unsupported = set(all_compress_ratios) - {0, 4, 128}
             if unsupported:
                 raise ValueError(
                     f"unsupported DeepSeek-V4 compression ratios: {unsupported}"
                 )
+            # V4 checkpoints can append compression ratios for auxiliary
+            # layers (for example, the bundled next-token prediction layer)
+            # after the `num_hidden_layers` transformer layers.  Only the
+            # transformer-layer prefix contributes to serving latency.
+            self.compress_ratios = all_compress_ratios[: self.num_hidden_layers]
+            self.extra_compress_ratios = all_compress_ratios[
+                self.num_hidden_layers :
+            ]
             self.compress_ratio_counts = Counter(self.compress_ratios)
 
         # FFN/MoE

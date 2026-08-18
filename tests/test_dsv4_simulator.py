@@ -21,9 +21,10 @@ class DSV4SimulatorTest(unittest.TestCase):
         self.assertEqual(self.config.attn_type, "DSA")
         self.assertEqual(self.config.head_dim, 512)
         self.assertEqual(self.config.qk_nope_head_dim, 448)
-        self.assertEqual(self.config.compress_ratio_counts[4], 29)
+        self.assertEqual(self.config.compress_ratio_counts[4], 30)
         self.assertEqual(self.config.compress_ratio_counts[128], 31)
-        self.assertEqual(self.config.compress_ratio_counts[0], 1)
+        self.assertEqual(self.config.compress_ratio_counts[0], 0)
+        self.assertEqual(self.config.extra_compress_ratios, (0,))
         self.assertEqual(self.config.num_routed_experts, 384)
         self.assertEqual(self.config.num_shared_experts, 1)
 
@@ -50,9 +51,9 @@ class DSV4SimulatorTest(unittest.TestCase):
             latency = attention.decode_attn_core(16, 40960, 0, "H20")
         self.assertGreater(latency, 0)
         text = output.getvalue()
-        self.assertIn("DSA C4: layers=29", text)
+        self.assertIn("DSA C4: layers=30", text)
         self.assertIn("DSA C128: layers=31", text)
-        self.assertIn("DSA C1: layers=1", text)
+        self.assertNotIn("DSA C1:", text)
 
 
 if __name__ == "__main__":
