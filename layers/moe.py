@@ -1,6 +1,6 @@
 from flops.flops import gemm_flops
 from hardware.gpu import TFLOPS_TO_GFLOPS, gpu_map
-from layers.attn import get_gemm_mfu_and_latency
+from layers.attn import get_gemm_mfu_and_latency, get_gemm_perf
 from mfu.mfu import (get_gemm_mfu, get_groupedgemm_decode_mfu,
                      get_groupedgemm_prefill_mfu)
 from params.params import get_expected_active_experts, load_moe_weights_time
@@ -82,7 +82,7 @@ class MoE:
 
         if self.config.num_shared_experts > 0:
             # TP shards intermediate_size; hidden_size is NOT sharded
-            shared_expert_up_proj = get_gemm_mfu_and_latency(
+            shared_expert_up_mfu, shared_expert_up_proj = get_gemm_perf(
                 m=bs,
                 k=self.config.hidden_size,
                 n=tp_intermediate_size * 2 * self.config.num_shared_experts,
@@ -90,7 +90,7 @@ class MoE:
                 use_fp8_gemm=self.use_fp8_gemm,
             )
 
-            shared_expert_down_proj = get_gemm_mfu_and_latency(
+            shared_expert_down_mfu, shared_expert_down_proj = get_gemm_perf(
                 m=bs,
                 k=tp_intermediate_size * self.config.num_shared_experts,
                 n=self.config.hidden_size,
@@ -102,6 +102,16 @@ class MoE:
                 "{:<40} {:<10.2f}".format(
                     "Shared expert latency (us):",
                     shared_expert_latency * 1e6,
+                )
+            )
+            print(
+                "{:<40} {:<10.3f}".format(
+                    "Shared expert up-proj MFU:", shared_expert_up_mfu
+                )
+            )
+            print(
+                "{:<40} {:<10.3f}".format(
+                    "Shared expert down-proj MFU:", shared_expert_down_mfu
                 )
             )
             if overlap_shared_expert:
