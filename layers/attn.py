@@ -10,15 +10,19 @@ from mfu.mfu import (
 )
 
 
-def get_gemm_mfu_and_latency(m, k, n, device_type, use_fp8_gemm):
+def get_gemm_perf(m, k, n, device_type, use_fp8_gemm):
     gpu = gpu_map[device_type]
     gflops = gemm_flops(m, k, n) / 1e9
     mfu = get_gemm_mfu(device_type, m, k, n)
     latency = gflops / (gpu.fp16_tflops * TFLOPS_TO_GFLOPS * mfu)
     if use_fp8_gemm:
         latency = gflops / (gpu.fp8_tflops * TFLOPS_TO_GFLOPS * mfu)
-    # print(f"Debug: gemm m:{m} k:{k} n:{n}")
-    return latency
+    return mfu, latency
+
+
+def get_gemm_mfu_and_latency(m, k, n, device_type, use_fp8_gemm):
+    """Compatibility wrapper for callers that only consume latency."""
+    return get_gemm_perf(m, k, n, device_type, use_fp8_gemm)[1]
 
 
 class MHA:
@@ -351,7 +355,7 @@ class DSA(MHA):
         pieces = [
             (
                 "Q_down_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     self.config.hidden_size,
                     self.config.q_lora_rank,
@@ -361,7 +365,7 @@ class DSA(MHA):
             ),
             (
                 "Q_up_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     self.config.q_lora_rank,
                     local_heads * self.config.head_dim,
@@ -371,7 +375,7 @@ class DSA(MHA):
             ),
             (
                 "KV_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     self.config.hidden_size,
                     self.config.head_dim,
@@ -381,7 +385,7 @@ class DSA(MHA):
             ),
             (
                 "O_down_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     local_heads * self.config.v_head_dim,
                     self.config.o_lora_rank,
@@ -391,7 +395,7 @@ class DSA(MHA):
             ),
             (
                 "O_up_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     self.config.o_lora_rank,
                     self.config.hidden_size,
@@ -401,7 +405,7 @@ class DSA(MHA):
             ),
             (
                 "Indexer_Q_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     self.config.q_lora_rank,
                     self.config.index_n_heads * self.config.index_head_dim,
@@ -411,7 +415,7 @@ class DSA(MHA):
             ),
             (
                 "Indexer_K_proj",
-                get_gemm_mfu_and_latency(
+                get_gemm_perf(
                     bs,
                     self.config.hidden_size,
                     self.config.index_head_dim,
@@ -420,9 +424,10 @@ class DSA(MHA):
                 ),
             ),
         ]
-        for name, latency in pieces:
+        for name, (mfu, latency) in pieces:
+            print(f"{name + ' MFU:':<40} {mfu:<10.3f}")
             print(f"{name + ' latency (us):':<40} {latency * 1e6:<10.2f}")
-        return sum(latency for _, latency in pieces)
+        return sum(latency for _, (_, latency) in pieces)
 
     def prefill_attn_core(self, seq_len, kvcache_bytes, device_type):
         raise NotImplementedError(
