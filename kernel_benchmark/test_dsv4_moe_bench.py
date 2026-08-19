@@ -18,9 +18,32 @@ GROUPED_GEMM_NAME = (
 
 
 class FakeEvent:
-    def __init__(self, name: str, duration_us: float):
+    def __init__(self, name: str, duration_us: float, kernels=None):
         self.name = name
         self.device_time_total = duration_us
+        self.kernels = [] if kernels is None else kernels
+
+
+class FakeKernel:
+    def __init__(self, name: str, duration_us: float):
+        self.name = name
+        self.duration = duration_us
+
+
+class FakeKinetoEvent:
+    def __init__(self, name: str, duration_ns: int, start_ns: int):
+        self._name = name
+        self._duration_ns = duration_ns
+        self._start_ns = start_ns
+
+    def name(self):
+        return self._name
+
+    def duration_ns(self):
+        return self._duration_ns
+
+    def start_ns(self):
+        return self._start_ns
 
 
 class DSV4MoeBenchTest(unittest.TestCase):
@@ -38,6 +61,89 @@ class DSV4MoeBenchTest(unittest.TestCase):
         self.assertEqual(samples["down_samples_us"], [135.0, 133.0])
         self.assertEqual(samples["up_median_us"], 150.0)
         self.assertEqual(samples["down_median_us"], 134.0)
+        self.assertEqual(samples["kernel_event_source"], "top-level events")
+
+    def test_extracts_grouped_gemms_from_nested_function_event_kernels(self):
+        events = [
+            FakeEvent(
+                "flashinfer::cutlass_fused_moe",
+                300.0,
+                kernels=[
+                    FakeKernel(GROUPED_GEMM_NAME, 152.0),
+                    FakeKernel("doActivationKernel", 20.0),
+                    FakeKernel(GROUPED_GEMM_NAME, 136.0),
+                ],
+            ),
+            FakeEvent(
+                "flashinfer::cutlass_fused_moe",
+                295.0,
+                kernels=[
+                    FakeKernel(GROUPED_GEMM_NAME, 148.0),
+                    FakeKernel("finalizeMoeRoutingKernel", 9.0),
+                    FakeKernel(GROUPED_GEMM_NAME, 132.0),
+                ],
+            ),
+        ]
+
+        samples = extract_grouped_gemm_samples(events, repeats=2)
+
+        self.assertEqual(samples["up_samples_us"], [152.0, 148.0])
+        self.assertEqual(samples["down_samples_us"], [136.0, 132.0])
+        self.assertEqual(samples["up_median_us"], 150.0)
+        self.assertEqual(samples["down_median_us"], 134.0)
+        self.assertEqual(
+            samples["kernel_event_source"], "FunctionEvent.kernels"
+        )
+
+    def test_nested_kernel_capture_is_not_double_counted(self):
+        events = [
+            FakeEvent(GROUPED_GEMM_NAME, 999.0),
+            FakeEvent(GROUPED_GEMM_NAME, 998.0),
+            FakeEvent(
+                "flashinfer::cutlass_fused_moe",
+                300.0,
+                kernels=[
+                    FakeKernel(GROUPED_GEMM_NAME, 151.0),
+                    FakeKernel(GROUPED_GEMM_NAME, 135.0),
+                ],
+            ),
+        ]
+
+        samples = extract_grouped_gemm_samples(events, repeats=1)
+
+        self.assertEqual(samples["up_samples_us"], [151.0])
+        self.assertEqual(samples["down_samples_us"], [135.0])
+        self.assertEqual(
+            samples["kernel_event_source"], "FunctionEvent.kernels"
+        )
+
+    def test_prefers_timestamp_sorted_low_level_kineto_events(self):
+        function_events = [
+            FakeEvent(
+                "flashinfer::cutlass_fused_moe",
+                300.0,
+                kernels=[
+                    FakeKernel(GROUPED_GEMM_NAME, 999.0),
+                    FakeKernel(GROUPED_GEMM_NAME, 998.0),
+                ],
+            )
+        ]
+        # Deliberately return the low-level events out of launch order.  Their
+        # nanosecond timestamps define FC1 then FC2.
+        kineto_events = [
+            FakeKinetoEvent(GROUPED_GEMM_NAME, 135_000, 20_000),
+            FakeKinetoEvent(GROUPED_GEMM_NAME, 151_000, 10_000),
+        ]
+
+        samples = extract_grouped_gemm_samples(
+            function_events, repeats=1, kineto_events=kineto_events
+        )
+
+        self.assertEqual(samples["up_samples_us"], [151.0])
+        self.assertEqual(samples["down_samples_us"], [135.0])
+        self.assertEqual(
+            samples["kernel_event_source"], "kineto_results.events"
+        )
 
     def test_rejects_incomplete_grouped_gemm_capture(self):
         events = [FakeEvent(GROUPED_GEMM_NAME, 151.0)]

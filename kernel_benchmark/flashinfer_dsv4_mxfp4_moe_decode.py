@@ -74,9 +74,29 @@ def is_cutlass_grouped_gemm_kernel(name: str) -> bool:
     return all(marker in lowered for marker in GROUPED_GEMM_NAME_MARKERS)
 
 
+def profiler_event_name(event) -> str:
+    """Read names from FunctionEvent attributes or Kineto accessors."""
+    value = getattr(event, "name", "")
+    if callable(value):
+        value = value()
+    return str(value)
+
+
 def profiler_event_duration_us(event) -> float:
     """Read a CUDA kernel duration from a raw ``torch.profiler`` event."""
+    # Low-level ``_KinetoEvent`` exposes nanoseconds through a method.  Use it
+    # before the microsecond fields used by FunctionEvent/Kernel records.
+    duration_ns = getattr(event, "duration_ns", None)
+    if duration_ns is not None:
+        value = duration_ns() if callable(duration_ns) else duration_ns
+        if float(value) > 0:
+            return float(value) / 1_000.0
+
     for attribute in (
+        # ``FunctionEvent.kernels`` contains ``Kernel`` records whose timing
+        # field is named ``duration``.  Top-level CUDA ``FunctionEvent``
+        # objects use one of the device/CUDA timing fields below instead.
+        "duration",
         "device_time",
         "device_time_total",
         "cuda_time",
@@ -94,32 +114,114 @@ def profiler_event_duration_us(event) -> float:
     raise RuntimeError(f"CUDA profiler event has no positive duration: {event!r}")
 
 
-def extract_grouped_gemm_samples(events, repeats: int) -> dict[str, object]:
+def _nested_profiler_kernels(event) -> tuple[object, ...]:
+    """Return CUDA kernel records attached to a CPU ``FunctionEvent``.
+
+    Depending on the PyTorch/Kineto version, ``profile.events()`` either
+    exposes CUDA kernels as top-level events or attaches them to the launching
+    CPU event through ``FunctionEvent.kernels``.  Normalize the latter without
+    assuming that every profiler event implements the attribute.
+    """
+    kernels = getattr(event, "kernels", None)
+    if kernels is None:
+        return ()
+    if callable(kernels):
+        kernels = kernels()
+    return tuple(kernels or ())
+
+
+def _event_start_ns(event) -> int | None:
+    value = getattr(event, "start_ns", None)
+    if value is None:
+        return None
+    value = value() if callable(value) else value
+    return int(value)
+
+
+def _collect_direct_matches(events) -> tuple[list[tuple[str, float]], set[str]]:
+    """Collect top-level kernel events, sorted by Kineto launch timestamp."""
+    matched: list[tuple[int | None, int, str, float]] = []
+    candidates: set[str] = set()
+    for index, event in enumerate(events):
+        name = profiler_event_name(event)
+        if "cutlass::device_kernel" in name.lower():
+            candidates.add(name)
+        if is_cutlass_grouped_gemm_kernel(name):
+            matched.append(
+                (
+                    _event_start_ns(event),
+                    index,
+                    name,
+                    profiler_event_duration_us(event),
+                )
+            )
+
+    # Kineto events can be returned in correlation order rather than strict
+    # launch order.  When timestamps are available, restore CUDA launch order.
+    if matched and all(start is not None for start, _, _, _ in matched):
+        matched.sort(key=lambda item: (item[0], item[1]))
+    return [(name, duration) for _, _, name, duration in matched], candidates
+
+
+def _collect_nested_matches(events) -> tuple[list[tuple[str, float]], set[str]]:
+    """Collect kernel records attached to FunctionEvent.kernels."""
+    matched: list[tuple[str, float]] = []
+    candidates: set[str] = set()
+    for event in events:
+        for kernel in _nested_profiler_kernels(event):
+            name = profiler_event_name(kernel)
+            if "cutlass::device_kernel" in name.lower():
+                candidates.add(name)
+            if is_cutlass_grouped_gemm_kernel(name):
+                matched.append((name, profiler_event_duration_us(kernel)))
+    return matched, candidates
+
+
+def extract_grouped_gemm_samples(
+    events,
+    repeats: int,
+    *,
+    kineto_events=None,
+) -> dict[str, object]:
     """Extract ordered FC1/FC2 kernel samples from raw profiler events.
 
     One FlashInfer MXFP4 MoE invocation must launch exactly two matching
     CUTLASS GroupProblemShape kernels.  Pairing is by launch order, not by
     kernel name, because FC1 and FC2 may use the same demangled kernel name.
     """
-    matched: list[tuple[str, float]] = []
-    for event in events:
-        name = str(getattr(event, "name", ""))
-        if is_cutlass_grouped_gemm_kernel(name):
-            matched.append((name, profiler_event_duration_us(event)))
+    events = tuple(events)
+    direct_matches, direct_candidates = _collect_direct_matches(events)
+    nested_matches, nested_candidates = _collect_nested_matches(events)
+    kineto_matches: list[tuple[str, float]] = []
+    kineto_candidates: set[str] = set()
+    if kineto_events is not None:
+        kineto_matches, kineto_candidates = _collect_direct_matches(
+            tuple(kineto_events)
+        )
 
     expected = 2 * repeats
-    if len(matched) != expected:
-        candidate_names = sorted(
-            {
-                str(getattr(event, "name", ""))
-                for event in events
-                if "cutlass::device_kernel" in str(getattr(event, "name", "")).lower()
-            }
-        )
+    # Never add representations together: profiler versions may expose the
+    # same launches in two or all three locations.  Low-level Kineto events
+    # are the most faithful source; nested kernels are the portable fallback.
+    if len(kineto_matches) == expected:
+        matched = kineto_matches
+        event_source = "kineto_results.events"
+    elif len(nested_matches) == expected:
+        matched = nested_matches
+        event_source = "FunctionEvent.kernels"
+    elif len(direct_matches) == expected:
+        matched = direct_matches
+        event_source = "top-level events"
+    else:
         raise RuntimeError(
             "expected exactly two CUTLASS grouped GEMM kernels per eager call: "
-            f"matched={len(matched)}, expected={expected}, repeats={repeats}; "
-            f"CUTLASS candidates={candidate_names}"
+            f"kineto_matched={len(kineto_matches)}, "
+            f"nested_matched={len(nested_matches)}, "
+            f"direct_matched={len(direct_matches)}, expected={expected}, "
+            f"repeats={repeats}; Kineto CUTLASS candidates="
+            f"{sorted(kineto_candidates)}; nested CUTLASS candidates="
+            f"{sorted(nested_candidates)}; direct CUTLASS candidates="
+            f"{sorted(direct_candidates)}"
         )
 
     up_samples = [duration for _, duration in matched[0::2]]
@@ -130,6 +232,7 @@ def extract_grouped_gemm_samples(events, repeats: int) -> dict[str, object]:
         "up_median_us": statistics.median(up_samples),
         "down_median_us": statistics.median(down_samples),
         "kernel_names": sorted({name for name, _ in matched}),
+        "kernel_event_source": event_source,
     }
 
 
@@ -333,7 +436,14 @@ def benchmark_point(
             measured_call()
         torch.cuda.synchronize()
 
-    samples = extract_grouped_gemm_samples(profiler.events(), repeats)
+    low_level_profiler = getattr(profiler, "profiler", None)
+    kineto_results = getattr(low_level_profiler, "kineto_results", None)
+    kineto_events = (
+        kineto_results.events() if kineto_results is not None else ()
+    )
+    samples = extract_grouped_gemm_samples(
+        profiler.events(), repeats, kineto_events=kineto_events
+    )
     up_latency_us = float(samples["up_median_us"])
     down_latency_us = float(samples["down_median_us"])
     total_latency_us = up_latency_us + down_latency_us
@@ -370,6 +480,7 @@ def benchmark_point(
                 "profiled_calls": repeats,
                 "profiled_grouped_gemm_kernels": 2 * repeats,
                 "kernel_names": samples["kernel_names"],
+                "kernel_event_source": samples["kernel_event_source"],
                 "weight_dtype": "mxfp4_e2m1",
                 "activation_dtype": "bf16",
                 "tp_size": shape["tp_size"],
