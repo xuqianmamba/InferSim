@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import io
 import unittest
 from pathlib import Path
@@ -11,6 +12,14 @@ from models.model import get_dsv4_runtime_layer_latency_us
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "tests" / "fixtures" / "deepseek_v4_pro.json"
+
+
+def read_csv_row(path, **expected):
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            if all(row[key] == str(value) for key, value in expected.items()):
+                return row
+    raise AssertionError(f"No matching row in {path}: {expected}")
 
 
 class DSV4SimulatorTest(unittest.TestCase):
@@ -30,20 +39,34 @@ class DSV4SimulatorTest(unittest.TestCase):
         self.assertEqual(self.config.num_shared_experts, 1)
 
     def test_tp8_uses_h64_latency_and_quarter_useful_mfu(self):
+        row = read_csv_row(
+            ROOT / "bench_data/dsa/decode/h20/attn-64-512-c4.csv",
+            kv_dtype="fp8",
+            batch_size=16,
+            kv_len=40960,
+        )
         with contextlib.chdir(ROOT):
             mfu, latency = get_dsa_decode_perf(
                 self.config, 16, 40960, "H20", True, 8, 4
             )
-        self.assertAlmostEqual(latency * 1e6, 67.424, places=3)
-        self.assertAlmostEqual(mfu, 0.242 / 4, places=6)
+        self.assertAlmostEqual(latency * 1e6, float(row["latency_us"]), places=3)
+        self.assertAlmostEqual(mfu, float(row["mfu"]) / 4, places=6)
 
     def test_indexer_lookup(self):
+        row = read_csv_row(
+            ROOT
+            / "bench_data/dsa/decode/h20/indexer-64-128-topk1024.csv",
+            batch_size=16,
+            kv_len=40960,
+        )
         with contextlib.chdir(ROOT):
             mfu, latency = get_dsa_indexer_decode_perf(
                 self.config, 16, 40960, "H20"
             )
-        self.assertAlmostEqual(latency * 1e6, 44.512, places=3)
-        self.assertAlmostEqual(mfu, 0.275, places=6)
+        self.assertAlmostEqual(
+            latency * 1e6, float(row["total_latency_us"]), places=3
+        )
+        self.assertAlmostEqual(mfu, float(row["logits_mfu"]), places=6)
 
     def test_weighted_decode_core_reports_layer_mix(self):
         attention = DSA(self.config, True, True, 8)
