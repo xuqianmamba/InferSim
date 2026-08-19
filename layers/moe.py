@@ -33,7 +33,7 @@ class MoE:
         )
         routed_experts_gflops *= bs * self.config.num_experts_per_tok * 3.0 / 1e9
 
-        measured_fused_latency = False
+        measured_grouped_gemm_latency = False
         decode_perf = None
         if self.config.is_moe:
             decode_perf = get_groupedgemm_decode_perf(
@@ -58,11 +58,11 @@ class MoE:
             )
 
         if decode_perf is not None and decode_perf["total_latency_s"] is not None:
-            # This is a direct timing of the complete W4A16 fused operator.
-            # It already includes both expert GEMMs, activation, dequantization,
-            # and weight reads; do not rescale it with a generic FP16/FP8 peak.
+            # This is the measured sum of the production W4A16 gate/up and
+            # down CUTLASS grouped GEMMs.  Activation/routing/finalization are
+            # intentionally modeled outside this grouped-GEMM table.
             routed_experts_latency = decode_perf["total_latency_s"]
-            measured_fused_latency = True
+            measured_grouped_gemm_latency = True
         else:
             routed_experts_latency = routed_experts_gflops / (
                 gpu.fp16_tflops * TFLOPS_TO_GFLOPS * routed_experts_mfu
@@ -84,7 +84,7 @@ class MoE:
             num_tokens=bs,
         )
         print("{:<40} {:<10.2f}".format("Routed experts/FFN MFU:", routed_experts_mfu))
-        if measured_fused_latency:
+        if measured_grouped_gemm_latency:
             print(
                 "{:<40} {:<10}".format(
                     "Routed experts benchmark:",
@@ -108,11 +108,11 @@ class MoE:
                 "Experts loading lower bound (us):", moe_load_time * 1e6
             )
         )
-        # A direct fused-kernel timing already contains its weight traffic.
-        # Legacy analytical rows still use max(compute, weight-load roofline).
+        # Direct grouped-GEMM timings already contain those GEMMs' weight
+        # traffic. Legacy analytical rows still use the weight-load roofline.
         t = (
             routed_experts_latency
-            if measured_fused_latency
+            if measured_grouped_gemm_latency
             else max(routed_experts_latency, moe_load_time)
         )
 

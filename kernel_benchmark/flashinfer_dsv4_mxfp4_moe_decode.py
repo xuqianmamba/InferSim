@@ -1,19 +1,22 @@
-"""Benchmark DeepSeek-V4's production FlashInfer MXFP4 fused-MoE kernel.
+"""Benchmark DeepSeek-V4's production FlashInfer MXFP4 grouped GEMMs.
 
 The timed region mirrors SGLang v0.5.17's SM90 ``flashinfer_mxfp4`` call,
 including its TP/EP topology and token-count tuning bucket.  Routing, random
 tensor creation, and FlashInfer's SM90 weight/scale interleave are deliberately
 outside the timed region.
 
-The generated lookup row records the fused operator latency directly.  The
-legacy up/down columns remain only so existing InferSim tables stay readable;
-they must not be interpreted as two separately measured projections.
+The lookup intentionally records only the two CUTLASS grouped GEMMs launched
+by ``cutlass_fused_moe``: gate/up (FC1) and down (FC2).  Routing, sorting,
+activation, finalization, and gaps between kernels are outside this lookup
+latency.  This matches InferSim's grouped-GEMM table contract and avoids
+mistaking the complete fused-operator span for each individual projection.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from pathlib import Path
 
 import torch
@@ -22,6 +25,11 @@ from dsv4_bench_utils import parse_int_list, write_csv
 
 
 GROUP_SIZE = 32
+GROUPED_GEMM_NAME_MARKERS = (
+    "cutlass::device_kernel",
+    "gemmuniversal",
+    "groupproblemshape",
+)
 CSV_FIELDS = (
     "num_experts",
     "num_gpus",
@@ -57,6 +65,71 @@ def next_power_of_2(value: int) -> int:
     if value <= 0:
         raise ValueError("value must be positive")
     return 1 << (value - 1).bit_length()
+
+
+def is_cutlass_grouped_gemm_kernel(name: str) -> bool:
+    """Return whether a profiler event is one production grouped GEMM kernel."""
+    lowered = name.lower()
+    return all(marker in lowered for marker in GROUPED_GEMM_NAME_MARKERS)
+
+
+def profiler_event_duration_us(event) -> float:
+    """Read a CUDA kernel duration from a raw ``torch.profiler`` event."""
+    for attribute in (
+        "device_time",
+        "device_time_total",
+        "cuda_time",
+        "cuda_time_total",
+    ):
+        value = getattr(event, attribute, None)
+        if value is not None and float(value) > 0:
+            return float(value)
+
+    time_range = getattr(event, "time_range", None)
+    if time_range is not None and hasattr(time_range, "elapsed_us"):
+        value = float(time_range.elapsed_us())
+        if value > 0:
+            return value
+    raise RuntimeError(f"CUDA profiler event has no positive duration: {event!r}")
+
+
+def extract_grouped_gemm_samples(events, repeats: int) -> dict[str, object]:
+    """Extract ordered FC1/FC2 kernel samples from raw profiler events.
+
+    One FlashInfer MXFP4 MoE invocation must launch exactly two matching
+    CUTLASS GroupProblemShape kernels.  Pairing is by launch order, not by
+    kernel name, because FC1 and FC2 may use the same demangled kernel name.
+    """
+    matched: list[tuple[str, float]] = []
+    for event in events:
+        name = str(getattr(event, "name", ""))
+        if is_cutlass_grouped_gemm_kernel(name):
+            matched.append((name, profiler_event_duration_us(event)))
+
+    expected = 2 * repeats
+    if len(matched) != expected:
+        candidate_names = sorted(
+            {
+                str(getattr(event, "name", ""))
+                for event in events
+                if "cutlass::device_kernel" in str(getattr(event, "name", "")).lower()
+            }
+        )
+        raise RuntimeError(
+            "expected exactly two CUTLASS grouped GEMM kernels per replay: "
+            f"matched={len(matched)}, expected={expected}, repeats={repeats}; "
+            f"CUTLASS candidates={candidate_names}"
+        )
+
+    up_samples = [duration for _, duration in matched[0::2]]
+    down_samples = [duration for _, duration in matched[1::2]]
+    return {
+        "up_samples_us": up_samples,
+        "down_samples_us": down_samples,
+        "up_median_us": statistics.median(up_samples),
+        "down_median_us": statistics.median(down_samples),
+        "kernel_names": sorted({name for name, _ in matched}),
+    }
 
 
 def load_shape(
@@ -180,6 +253,7 @@ def benchmark_point(
 ) -> dict:
     from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
+    from torch.profiler import ProfilerActivity, profile
 
     generator = torch.Generator(device="cuda").manual_seed(4321 + tokens)
     hidden_states = torch.randn(
@@ -244,37 +318,60 @@ def benchmark_point(
     else:
         raise ValueError(f"unsupported execution mode: {execution_mode}")
 
-    # Ensure graph capture itself is outside the measured samples.
+    # Ensure graph capture and the first graph replay are outside the formal
+    # profiler region.  The latter avoids including one-time graph-launch
+    # setup in the first grouped-GEMM sample.
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    samples = []
-    for _ in range(repeats):
-        start.record()
-        measured_call()
-        end.record()
-        end.synchronize()
-        samples.append(start.elapsed_time(end) * 1000.0)
-    latency_us = sorted(samples)[len(samples) // 2]
+    measured_call()
+    torch.cuda.synchronize()
 
-    # Same useful-FLOP model as layers/moe.py: gate/up/down = three GEMMs.
-    flops = (
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        record_shapes=False,
+        profile_memory=False,
+        with_stack=False,
+    ) as profiler:
+        for _ in range(repeats):
+            measured_call()
+        torch.cuda.synchronize()
+
+    samples = extract_grouped_gemm_samples(profiler.events(), repeats)
+    up_latency_us = float(samples["up_median_us"])
+    down_latency_us = float(samples["down_median_us"])
+    total_latency_us = up_latency_us + down_latency_us
+
+    # Gate/up is two HxI GEMMs; down is one IxH GEMM.  Report their useful
+    # FLOPs and MFUs separately instead of assigning one fused-span metric to
+    # both legacy projection columns.
+    one_projection_flops = (
         2
         * shape["hidden"]
         * shape["intermediate"]
         * tokens
         * shape["topk"]
-        * 3
     )
-    achieved_tflops = flops / (latency_us * 1e-6) / 1e12
-    mfu = achieved_tflops / peak_tflops
+    up_flops = 2 * one_projection_flops
+    down_flops = one_projection_flops
+    total_flops = up_flops + down_flops
+    up_tflops = up_flops / (up_latency_us * 1e-6) / 1e12
+    down_tflops = down_flops / (down_latency_us * 1e-6) / 1e12
+    total_tflops = total_flops / (total_latency_us * 1e-6) / 1e12
+    up_mfu = up_tflops / peak_tflops
+    down_mfu = down_tflops / peak_tflops
+    total_mfu = total_tflops / peak_tflops
     print(
         json.dumps(
             {
                 "batch_size": tokens,
-                "latency_us": round(latency_us, 3),
-                "achieved_tflops": round(achieved_tflops, 3),
-                "mfu": round(mfu, 6),
+                "up_proj_us": round(up_latency_us, 3),
+                "down_proj_us": round(down_latency_us, 3),
+                "grouped_gemm_total_us": round(total_latency_us, 3),
+                "up_mfu": round(up_mfu, 6),
+                "down_mfu": round(down_mfu, 6),
+                "total_mfu": round(total_mfu, 6),
+                "profiled_replays": repeats,
+                "profiled_grouped_gemm_kernels": 2 * repeats,
+                "kernel_names": samples["kernel_names"],
                 "weight_dtype": "mxfp4_e2m1",
                 "activation_dtype": "bf16",
                 "tp_size": shape["tp_size"],
@@ -296,15 +393,13 @@ def benchmark_point(
         "tokens_per_expert": round(
             tokens * shape["topk"] / shape["num_local_experts"]
         ),
-        # Deprecated compatibility fields.  This is one fused measurement, not
-        # two separately timed projections.  New consumers use total_latency_us.
-        "up_proj_us": round(latency_us, 3),
-        "up_mfu": round(mfu, 6),
-        "down_proj_us": round(latency_us, 3),
-        "down_mfu": round(mfu, 6),
-        "total_latency_us": round(latency_us, 3),
-        "total_mfu": round(mfu, 6),
-        "kernel_kind": "fused_gate_up_swiglu_down",
+        "up_proj_us": round(up_latency_us, 3),
+        "up_mfu": round(up_mfu, 6),
+        "down_proj_us": round(down_latency_us, 3),
+        "down_mfu": round(down_mfu, 6),
+        "total_latency_us": round(total_latency_us, 3),
+        "total_mfu": round(total_mfu, 6),
+        "kernel_kind": "cutlass_grouped_gemm_pair",
         "backend": "flashinfer_mxfp4_sm90",
         "activation_dtype": "bf16",
         "weight_dtype": "mxfp4_e2m1",

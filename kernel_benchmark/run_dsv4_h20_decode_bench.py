@@ -78,6 +78,7 @@ MATRIX_FILES = {
     ),
     "groupedgemm-decode-dsv4-tp8dp1.csv": MOE_FIELDS,
 }
+MOE_FILE = "groupedgemm-decode-dsv4-tp8dp1.csv"
 
 
 def run(command: list[str]) -> None:
@@ -87,6 +88,8 @@ def run(command: list[str]) -> None:
 
 def validate(output_dir: Path, attention_rows: int, moe_rows: int) -> None:
     for name, expected_fields in MATRIX_FILES.items():
+        if name == MOE_FILE:
+            continue
         path = output_dir / name
         if not path.is_file():
             raise RuntimeError(f"missing benchmark output: {path}")
@@ -97,10 +100,39 @@ def validate(output_dir: Path, attention_rows: int, moe_rows: int) -> None:
                 raise RuntimeError(
                     f"unexpected fields in {path}: {reader.fieldnames}; expected {expected_fields}"
                 )
-        expected_rows = moe_rows if name.startswith("groupedgemm-") else attention_rows
-        if len(rows) != expected_rows:
-            raise RuntimeError(f"{path} has {len(rows)} rows, expected {expected_rows}")
+        if len(rows) != attention_rows:
+            raise RuntimeError(
+                f"{path} has {len(rows)} rows, expected {attention_rows}"
+            )
         print(f"OK {path}: rows={len(rows)}")
+    validate_moe(output_dir, moe_rows)
+
+
+def validate_moe(output_dir: Path, expected_rows: int) -> None:
+    path = output_dir / MOE_FILE
+    expected_fields = MATRIX_FILES[MOE_FILE]
+    if not path.is_file():
+        raise RuntimeError(f"missing benchmark output: {path}")
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+        if tuple(reader.fieldnames or ()) != expected_fields:
+            raise RuntimeError(
+                f"unexpected fields in {path}: {reader.fieldnames}; "
+                f"expected {expected_fields}"
+            )
+    if len(rows) != expected_rows:
+        raise RuntimeError(f"{path} has {len(rows)} rows, expected {expected_rows}")
+    for row in rows:
+        if row["kernel_kind"] != "cutlass_grouped_gemm_pair":
+            raise RuntimeError(f"unexpected MoE timing semantics in {path}: {row}")
+        if abs(
+            float(row["total_latency_us"])
+            - float(row["up_proj_us"])
+            - float(row["down_proj_us"])
+        ) > 0.002:
+            raise RuntimeError(f"MoE grouped-GEMM total is inconsistent: {row}")
+    print(f"OK {path}: rows={len(rows)}")
 
 
 def replace_file(source: Path, destination: Path) -> None:
@@ -108,6 +140,57 @@ def replace_file(source: Path, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     shutil.copyfile(source, temporary)
     os.replace(temporary, destination)
+
+
+def install_moe_results(output_dir: Path, repository: Path) -> None:
+    """Install only the measured TP8DP1 batch rows, preserving all others."""
+    source = output_dir / MOE_FILE
+    target = repository / "bench_data" / "grouped_gemm" / "decode" / "h20" / "data.csv"
+    with source.open(newline="", encoding="utf-8") as handle:
+        new_reader = csv.DictReader(handle)
+        new_rows = list(new_reader)
+        fields = tuple(new_reader.fieldnames or ())
+    expected = MATRIX_FILES[source.name]
+    if fields != expected:
+        raise RuntimeError(f"unexpected MoE fields: {fields}; expected {expected}")
+    if not new_rows:
+        raise RuntimeError(f"no MoE rows to install: {source}")
+
+    # Include batch_size_per_gpu in the replacement key.  A BS16-only refresh
+    # must not delete valid BS24/26/32 rows for the same model shape.
+    key_fields = LEGACY_MOE_FIELDS[:7]
+    replace_keys = {
+        tuple(row[field] for field in key_fields) for row in new_rows
+    }
+    kept_rows = []
+    old_fields = ()
+    if target.is_file():
+        backup = output_dir / "grouped_gemm-decode-h20-data.before.csv"
+        shutil.copy2(target, backup)
+        print(f"BACKUP {target} -> {backup}")
+        with target.open(newline="", encoding="utf-8") as handle:
+            old_reader = csv.DictReader(handle)
+            old_fields = tuple(old_reader.fieldnames or ())
+            missing_legacy = set(LEGACY_MOE_FIELDS) - set(old_fields)
+            if missing_legacy:
+                raise RuntimeError(
+                    f"existing MoE table lacks legacy fields {missing_legacy}: {target}"
+                )
+            for row in old_reader:
+                key = tuple(row[field] for field in key_fields)
+                if key not in replace_keys:
+                    kept_rows.append(row)
+
+    # New optional columns are appended without breaking historical rows.
+    output_fields = fields + tuple(field for field in old_fields if field not in fields)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=output_fields, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(kept_rows + new_rows)
+    os.replace(temporary, target)
+    print(f"INSTALLED DSV4 TP8DP1 grouped-GEMM data: {target}")
 
 
 def install_results(output_dir: Path, repository: Path) -> None:
@@ -120,44 +203,7 @@ def install_results(output_dir: Path, repository: Path) -> None:
         "logits-64-128.csv",
     ):
         replace_file(output_dir / name, dsa_dir / name)
-
-    source = output_dir / "groupedgemm-decode-dsv4-tp8dp1.csv"
-    target = repository / "bench_data" / "grouped_gemm" / "decode" / "h20" / "data.csv"
-    with source.open(newline="", encoding="utf-8") as handle:
-        new_reader = csv.DictReader(handle)
-        new_rows = list(new_reader)
-        fields = tuple(new_reader.fieldnames or ())
-    expected = MATRIX_FILES[source.name]
-    if fields != expected:
-        raise RuntimeError(f"unexpected MoE fields: {fields}; expected {expected}")
-
-    replace_key = tuple(new_rows[0][field] for field in fields[:6])
-    kept_rows = []
-    old_fields = ()
-    if target.is_file():
-        with target.open(newline="", encoding="utf-8") as handle:
-            old_reader = csv.DictReader(handle)
-            old_fields = tuple(old_reader.fieldnames or ())
-            missing_legacy = set(LEGACY_MOE_FIELDS) - set(old_fields)
-            if missing_legacy:
-                raise RuntimeError(
-                    f"existing MoE table lacks legacy fields {missing_legacy}: {target}"
-                )
-            for row in old_reader:
-                key = tuple(row[field] for field in fields[:6])
-                if key != replace_key:
-                    kept_rows.append(row)
-
-    # New optional columns are appended without breaking historical rows.
-    output_fields = fields + tuple(field for field in old_fields if field not in fields)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=output_fields, lineterminator="\n")
-        writer.writeheader()
-        writer.writerows(kept_rows + new_rows)
-    os.replace(temporary, target)
-    print(f"INSTALLED DSV4 TP8DP1 lookup data under {repository / 'bench_data'}")
+    install_moe_results(output_dir, repository)
 
 
 def main() -> None:
@@ -178,6 +224,11 @@ def main() -> None:
         "--install",
         action="store_true",
         help="Overwrite the repository's validated H20 DSV4 lookup data.",
+    )
+    parser.add_argument(
+        "--moe-only",
+        action="store_true",
+        help="Run, validate, and optionally install only the routed-MoE lookup.",
     )
     args = parser.parse_args()
     if args.install and args.execution_mode != "graph":
@@ -200,24 +251,25 @@ def main() -> None:
         "--output-dir",
         str(output_dir),
     ]
-    run(
-        [
-            sys.executable,
-            str(script_dir / "flashmla_dsv4_sparse_decode.py"),
-            "--attention-tp-size",
-            "8",
-            "--kernel-query-heads",
-            "64",
-            *common,
-        ]
-    )
-    run(
-        [
-            sys.executable,
-            str(script_dir / "deepgemm_dsv4_indexer_decode.py"),
-            *common,
-        ]
-    )
+    if not args.moe_only:
+        run(
+            [
+                sys.executable,
+                str(script_dir / "flashmla_dsv4_sparse_decode.py"),
+                "--attention-tp-size",
+                "8",
+                "--kernel-query-heads",
+                "64",
+                *common,
+            ]
+        )
+        run(
+            [
+                sys.executable,
+                str(script_dir / "deepgemm_dsv4_indexer_decode.py"),
+                *common,
+            ]
+        )
     run(
         [
             sys.executable,
@@ -241,10 +293,15 @@ def main() -> None:
         ]
     )
     batch_count = len([item for item in args.batch_sizes.split(",") if item.strip()])
-    kv_count = len([item for item in args.kv_lens.split(",") if item.strip()])
-    validate(output_dir, batch_count * kv_count, batch_count)
-    if args.install:
-        install_results(output_dir, script_dir.parent)
+    if args.moe_only:
+        validate_moe(output_dir, batch_count)
+        if args.install:
+            install_moe_results(output_dir, script_dir.parent)
+    else:
+        kv_count = len([item for item in args.kv_lens.split(",") if item.strip()])
+        validate(output_dir, batch_count * kv_count, batch_count)
+        if args.install:
+            install_results(output_dir, script_dir.parent)
     print("RUN_COMPLETE")
 
 

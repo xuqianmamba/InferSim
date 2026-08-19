@@ -95,7 +95,7 @@ class DSV4SimulatorTest(unittest.TestCase):
         expected = (30 * 636.574 + 31 * 573.050) / 61
         self.assertAlmostEqual(latency_us, expected, places=6)
 
-    def test_fused_mxfp4_lookup_returns_direct_latency(self):
+    def test_mxfp4_grouped_gemm_lookup_returns_direct_latency(self):
         fields = (
             "num_experts,num_gpus,num_local_experts,topk,hidden_size,"
             "intermediate_size,batch_size_per_gpu,tokens_per_expert,"
@@ -115,13 +115,13 @@ class DSV4SimulatorTest(unittest.TestCase):
             intermediate_size=384,
             batch_size_per_gpu=16,
             tokens_per_expert=0,
-            up_proj_us=321.5,
+            up_proj_us=214.0,
             up_mfu=0.033,
-            down_proj_us=321.5,
+            down_proj_us=107.5,
             down_mfu=0.033,
             total_latency_us=321.5,
             total_mfu=0.033,
-            kernel_kind="fused_gate_up_swiglu_down",
+            kernel_kind="cutlass_grouped_gemm_pair",
             backend="flashinfer_mxfp4_sm90",
             activation_dtype="bf16",
             weight_dtype="mxfp4_e2m1",
@@ -149,13 +149,13 @@ class DSV4SimulatorTest(unittest.TestCase):
         self.assertEqual(bf16["total_latency_s"], fp8_flag["total_latency_s"])
         self.assertEqual(bf16["weight_dtype"], "mxfp4_e2m1")
 
-    def test_fused_mxfp4_latency_already_includes_weight_loading(self):
+    def test_mxfp4_grouped_gemm_latency_includes_its_weight_loading(self):
         perf = {
             "up_mfu": 0.033,
             "down_mfu": 0.033,
             "total_mfu": 0.033,
             "total_latency_s": 321.5e-6,
-            "kernel_kind": "fused_gate_up_swiglu_down",
+            "kernel_kind": "cutlass_grouped_gemm_pair",
             "backend": "flashinfer_mxfp4_sm90",
             "activation_dtype": "bf16",
             "weight_dtype": "mxfp4_e2m1",

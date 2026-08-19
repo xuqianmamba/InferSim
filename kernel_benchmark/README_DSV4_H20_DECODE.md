@@ -28,9 +28,9 @@ The default matrix covers the observed TP8DP1 serving shapes:
 - `attn-64-512-c128.csv`: combined SWA + C128 FlashMLA attention latency.
 - `logits-64-128.csv`: compatibility table for the DeepGEMM logits kernel.
 - `indexer-64-128-topk1024.csv`: logits, top-k, and combined indexer latency.
-- `groupedgemm-decode-dsv4-tp8dp1.csv`: production
-  `flashinfer_mxfp4` fused routed-MoE latency and diagnostic useful MFU (384
-  experts, top-k 6, hidden 7168, TP-sharded intermediate size 384).
+- `groupedgemm-decode-dsv4-tp8dp1.csv`: the two production CUTLASS grouped
+  GEMMs launched by `flashinfer_mxfp4` (384 experts, top-k 6, hidden 7168,
+  TP-sharded intermediate size 384).
 
 The MoE benchmark follows SGLang v0.5.17's H20/SM90 W4A16 production call:
 
@@ -41,13 +41,12 @@ The MoE benchmark follows SGLang v0.5.17's H20/SM90 W4A16 production call:
   same token-bucket tactic as serving;
 - CUDA Graph replay by default, matching steady-state decode.
 
-The generated MoE CSV stores `total_latency_us` for the complete fused
-gate/up + SwiGLU + down operator. That measured latency is authoritative in
-InferSim and is not converted back through a generic FP16/FP8 peak. The
-historical `up_proj_*` and `down_proj_*` columns are retained for table
-compatibility only; they are deprecated for fused rows and must not be added
-together. `total_mfu` is a diagnostic useful-FLOP normalization, not a claim
-about the native MXFP4 hardware peak.
+The benchmark profiles raw CUDA events and requires exactly two matching
+CUTLASS `GroupProblemShape` kernels per replay. It records the first as
+`up_proj_us` (fused gate/up), the second as `down_proj_us`, and stores their sum
+as `total_latency_us`. Routing, sorting, SwiGLU activation, finalization, and
+kernel gaps are deliberately excluded. `total_mfu` is a diagnostic
+useful-FLOP normalization, not a claim about the native MXFP4 hardware peak.
 
 Routing IDs in this microbenchmark use a deterministic synthetic distribution.
 The CSV records its active-expert and maximum-expert-load statistics. If an
@@ -98,3 +97,23 @@ runner overwrites H20 DSA files and replaces only matching DSV4 TP8DP1 rows in
 Only graph-mode results may be installed. Use `--execution-mode eager` without
 `--install` for a diagnostic A/B; an eager result is never production lookup
 data.
+
+To refresh only the MoE grouped-GEMM table, without rerunning attention and
+indexer benchmarks:
+
+```bash
+"$PY" "$REPO/kernel_benchmark/run_dsv4_h20_decode_bench.py" \
+  --config-path "$MODEL/config.json" \
+  --output-dir "$OUT" \
+  --batch-sizes 16,24,26,32 \
+  --warmup 10 \
+  --repeats 50 \
+  --execution-mode graph \
+  --moe-only \
+  --install
+```
+
+MoE installation keys include `batch_size_per_gpu`, so a partial BS16 refresh
+does not delete BS24/26/32. Before replacement, the prior H20 grouped-GEMM
+table is copied to `grouped_gemm-decode-h20-data.before.csv` in the output
+directory.

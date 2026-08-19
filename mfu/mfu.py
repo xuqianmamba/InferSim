@@ -217,11 +217,11 @@ def get_groupedgemm_decode_perf(
 ):
     """Return the best matching decode MoE benchmark row.
 
-    Historical rows contain independently measured up/down GEMM MFUs.  New
-    MXFP4 rows contain one production-equivalent fused gate/up/SwiGLU/down
-    timing.  For those rows ``total_latency_s`` is authoritative: converting
-    latency to an MFU and then back through a caller-selected FP16/FP8 peak is
-    both lossy and incorrect for a W4A16 kernel.
+    Historical rows contain independently measured up/down GEMM MFUs. New
+    MXFP4 rows contain direct timings of the two production CUTLASS grouped
+    GEMMs (gate/up and down), with ``total_latency_s`` equal to their sum.
+    That latency is authoritative: converting it to an MFU and back through a
+    caller-selected FP16/FP8 peak is lossy and incorrect for W4A16 kernels.
     """
     gpu = gpu_map[device_type]
     file_name = f"bench_data/grouped_gemm/decode/{device_type.lower()}/data.csv"
@@ -241,7 +241,7 @@ def get_groupedgemm_decode_perf(
         }
 
     # The first 12 columns are the historical schema.  Optional columns after
-    # that describe a fused operator and are consumed by name.
+    # that describe a production grouped-GEMM pair and are consumed by name.
     ep_size = num_gpus // tp_size
     expected_num_local_experts = config.num_routed_experts // ep_size
     rows = list()
