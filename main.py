@@ -22,6 +22,21 @@ def non_negative_float(value):
 def main(args):
     config = ModelConfig(args.config_path)
 
+    dsv4_layer_latencies = (
+        getattr(args, "dsv4_c4_layer_latency_us", None),
+        getattr(args, "dsv4_c128_layer_latency_us", None),
+    )
+    if any(value is not None for value in dsv4_layer_latencies):
+        if not all(value is not None for value in dsv4_layer_latencies):
+            raise ValueError(
+                "--dsv4-c4-layer-latency-us and "
+                "--dsv4-c128-layer-latency-us must be provided together"
+            )
+        if config.attn_type != "DSA":
+            raise ValueError(
+                "DSV4 runtime layer calibration is only supported for DSA models"
+            )
+
     enable_shared_expert_overlap = getattr(
         args, "enable_shared_expert_overlap", False
     )
@@ -134,6 +149,26 @@ if __name__ == "__main__":
         help=(
             "Override decode scheduler overhead in milliseconds. If omitted, "
             "use the existing model default."
+        ),
+    )
+    parser.add_argument(
+        "--dsv4-c4-layer-latency-us",
+        type=non_negative_float,
+        default=None,
+        help=(
+            "Measured end-to-end decoder-layer GPU critical-path latency in "
+            "microseconds for a DeepSeek-V4 C4 layer. Must be used together "
+            "with --dsv4-c128-layer-latency-us."
+        ),
+    )
+    parser.add_argument(
+        "--dsv4-c128-layer-latency-us",
+        type=non_negative_float,
+        default=None,
+        help=(
+            "Measured end-to-end decoder-layer GPU critical-path latency in "
+            "microseconds for a DeepSeek-V4 C128 layer. Must be used together "
+            "with --dsv4-c4-layer-latency-us."
         ),
     )
     parser.add_argument(

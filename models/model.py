@@ -9,6 +9,30 @@ from layers.moe import MoE
 from params.params import get_attn_params_size, get_expert_params_size
 
 
+def get_dsv4_runtime_layer_latency_us(config, c4_latency_us, c128_latency_us):
+    """Return the layer-mix-weighted DSV4 runtime critical-path latency.
+
+    ``c4_latency_us`` and ``c128_latency_us`` are full decoder-layer GPU spans,
+    not isolated attention-kernel times.  Keeping this calculation separate
+    prevents standalone kernel lookup latencies from being confused with the
+    overlapped/fused runtime critical path.
+    """
+
+    c4_layers = config.compress_ratio_counts.get(4, 0)
+    c128_layers = config.compress_ratio_counts.get(128, 0)
+    calibrated_layers = c4_layers + c128_layers
+    if calibrated_layers != config.num_hidden_layers:
+        raise ValueError(
+            "DSV4 runtime calibration requires every hidden layer to be C4 "
+            f"or C128, got C4={c4_layers}, C128={c128_layers}, "
+            f"hidden_layers={config.num_hidden_layers}"
+        )
+
+    return (
+        c4_layers * c4_latency_us + c128_layers * c128_latency_us
+    ) / calibrated_layers
+
+
 class Model:
     def __init__(self, args, config):
         self.gpu = gpu_map[args.device_type]
@@ -257,26 +281,90 @@ class Model:
         num_tokens = self.target_bs
         if self.args.enable_tbo:
             num_tokens *= 2
-            tpot = max(
+            analytical_layer_time = max(
                 attn_core_time + attn_other_time, moe_time + comm_time1 + comm_time2
             )
-            tpot *= 2
+            analytical_layer_time *= 2
         else:
-            tpot = attn_core_time
-            tpot += attn_other_time
-            tpot += moe_time
-            tpot += comm_time1 + comm_time2
-            tpot += tp_comm_time  # Add TP communication time
-        tpot *= self.config.num_hidden_layers
-        tpot *= 1000  # convert to ms
+            analytical_layer_time = attn_core_time
+            analytical_layer_time += attn_other_time
+            analytical_layer_time += moe_time
+            analytical_layer_time += comm_time1 + comm_time2
+            analytical_layer_time += tp_comm_time  # Add TP communication time
         scheduler_overhead_ms = getattr(
             self.args, "decode_scheduler_overhead_ms", None
         )
         if scheduler_overhead_ms is None:
             scheduler_overhead_ms = 5
-        tpot += scheduler_overhead_ms
+
+        analytical_tpot_ms = (
+            analytical_layer_time * self.config.num_hidden_layers * 1000
+            + scheduler_overhead_ms
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Analytical layer latency (us):", analytical_layer_time * 1e6
+            )
+        )
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Analytical TPOT (ms):", analytical_tpot_ms
+            )
+        )
+
+        c4_layer_latency_us = getattr(
+            self.args, "dsv4_c4_layer_latency_us", None
+        )
+        c128_layer_latency_us = getattr(
+            self.args, "dsv4_c128_layer_latency_us", None
+        )
+        if c4_layer_latency_us is not None:
+            runtime_layer_latency_us = get_dsv4_runtime_layer_latency_us(
+                self.config,
+                c4_layer_latency_us,
+                c128_layer_latency_us,
+            )
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Runtime C4 layer latency (us):", c4_layer_latency_us
+                )
+            )
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Runtime C128 layer latency (us):", c128_layer_latency_us
+                )
+            )
+            print(
+                "{:<40} {:<10.2f}".format(
+                    "Runtime weighted layer latency (us):",
+                    runtime_layer_latency_us,
+                )
+            )
+            tpot = (
+                runtime_layer_latency_us
+                * self.config.num_hidden_layers
+                / 1000
+                + scheduler_overhead_ms
+            )
+            print(
+                "{:<40} {:<10}".format(
+                    "Decode latency model:", "runtime-calibrated"
+                )
+            )
+        else:
+            tpot = analytical_tpot_ms
+            print(
+                "{:<40} {:<10}".format(
+                    "Decode latency model:", "analytical lookup"
+                )
+            )
 
         print("{:<40} {:<10.2f}".format("TPOT (ms):", tpot))
-        print("{:<40} {:<10.0f}".format("Throughput (TGS:tok/GPU/s):", num_tokens / self.args.tp_size / (tpot / 1000)))
+        print(
+            "{:<40} {:<10.0f}".format(
+                "Throughput (TGS:tok/GPU/s):",
+                num_tokens / self.args.tp_size / (tpot / 1000),
+            )
+        )
         if tpot > self.args.target_tpot:
             print("!Error: TPOT > SLO, need smaller GFLOPs to speedup")

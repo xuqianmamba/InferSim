@@ -102,6 +102,20 @@ generic models.
 bash example/deepseek-v4-pro/decode_h20_tp8.sh /path/to/config.json
 ```
 
+Standalone kernel benchmarks describe isolated execution. They can overstate
+runtime TPOT when the serving engine fuses or overlaps work. If complete C4 and
+C128 decoder-layer GPU critical-path spans have been measured with Nsight
+Systems, use the runtime-calibrated example instead:
+
+```bash
+bash example/deepseek-v4-pro/decode_h20_tp8_nsys_calibrated.sh /path/to/config.json
+```
+
+This mode still prints the analytical lookup breakdown and analytical TPOT,
+then reports a separate runtime-calibrated TPOT. The two layer-latency flags
+must always be supplied together. They are full decoder-layer spans, not sparse
+attention kernel durations.
+
 ```
 $ bash example/qwen3-30B-A3B/decode.sh
 

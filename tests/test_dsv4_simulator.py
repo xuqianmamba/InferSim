@@ -6,6 +6,7 @@ from pathlib import Path
 from config.model_config import ModelConfig
 from layers.attn import DSA
 from mfu.mfu import get_dsa_decode_perf, get_dsa_indexer_decode_perf
+from models.model import get_dsv4_runtime_layer_latency_us
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,15 @@ class DSV4SimulatorTest(unittest.TestCase):
         self.assertIn("DSA C4: layers=30", text)
         self.assertIn("DSA C128: layers=31", text)
         self.assertNotIn("DSA C1:", text)
+
+    def test_runtime_layer_calibration_uses_dsv4_layer_mix(self):
+        latency_us = get_dsv4_runtime_layer_latency_us(
+            self.config,
+            c4_latency_us=636.574,
+            c128_latency_us=573.050,
+        )
+        expected = (30 * 636.574 + 31 * 573.050) / 61
+        self.assertAlmostEqual(latency_us, expected, places=6)
 
 
 if __name__ == "__main__":
