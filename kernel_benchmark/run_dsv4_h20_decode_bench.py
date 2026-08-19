@@ -216,9 +216,9 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument(
         "--execution-mode",
-        choices=("graph", "eager"),
-        default="graph",
-        help="Execution mode for the MXFP4 MoE benchmark.",
+        choices=("eager",),
+        default="eager",
+        help="Eager single-kernel profiling mode for the MXFP4 MoE benchmark.",
     )
     parser.add_argument(
         "--install",
@@ -231,8 +231,8 @@ def main() -> None:
         help="Run, validate, and optionally install only the routed-MoE lookup.",
     )
     args = parser.parse_args()
-    if args.install and args.execution_mode != "graph":
-        raise SystemExit("only graph-mode MoE results may be installed")
+    if args.install and args.execution_mode != "eager":
+        raise SystemExit("only eager single-kernel MoE results may be installed")
 
     script_dir = Path(__file__).resolve().parent
     output_dir = Path(args.output_dir).resolve()

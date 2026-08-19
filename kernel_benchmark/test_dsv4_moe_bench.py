@@ -24,7 +24,7 @@ class FakeEvent:
 
 
 class DSV4MoeBenchTest(unittest.TestCase):
-    def test_extracts_two_ordered_grouped_gemms_per_replay(self):
+    def test_extracts_two_ordered_grouped_gemms_per_eager_call(self):
         events = [
             FakeEvent(GROUPED_GEMM_NAME, 151.0),
             FakeEvent("doActivationKernel", 20.0),

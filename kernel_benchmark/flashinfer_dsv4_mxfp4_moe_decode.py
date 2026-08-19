@@ -1,9 +1,10 @@
 """Benchmark DeepSeek-V4's production FlashInfer MXFP4 grouped GEMMs.
 
-The timed region mirrors SGLang v0.5.17's SM90 ``flashinfer_mxfp4`` call,
-including its TP/EP topology and token-count tuning bucket.  Routing, random
-tensor creation, and FlashInfer's SM90 weight/scale interleave are deliberately
-outside the timed region.
+The profiled call mirrors SGLang v0.5.17's SM90 ``flashinfer_mxfp4`` operator,
+including its TP/EP topology and token-count tuning bucket.  It is launched in
+eager mode so the profiler can observe each CUDA kernel independently. Routing,
+random tensor creation, and FlashInfer's SM90 weight/scale interleave are
+deliberately outside the timed region.
 
 The lookup intentionally records only the two CUTLASS grouped GEMMs launched
 by ``cutlass_fused_moe``: gate/up (FC1) and down (FC2).  Routing, sorting,
@@ -116,7 +117,7 @@ def extract_grouped_gemm_samples(events, repeats: int) -> dict[str, object]:
             }
         )
         raise RuntimeError(
-            "expected exactly two CUTLASS grouped GEMM kernels per replay: "
+            "expected exactly two CUTLASS grouped GEMM kernels per eager call: "
             f"matched={len(matched)}, expected={expected}, repeats={repeats}; "
             f"CUTLASS candidates={candidate_names}"
         )
@@ -308,19 +309,15 @@ def benchmark_point(
         call()
     torch.cuda.synchronize()
 
-    if execution_mode == "graph":
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            call()
-        measured_call = graph.replay
-    elif execution_mode == "eager":
-        measured_call = call
-    else:
-        raise ValueError(f"unsupported execution mode: {execution_mode}")
+    if execution_mode != "eager":
+        raise ValueError(
+            "grouped-GEMM lookup generation requires eager mode so individual "
+            "CUDA kernels remain visible to the profiler"
+        )
 
-    # Ensure graph capture and the first graph replay are outside the formal
-    # profiler region.  The latter avoids including one-time graph-launch
-    # setup in the first grouped-GEMM sample.
+    # Keep one extra eager call outside the formal profiler region so any
+    # lazy tactic/kernel initialization cannot affect the first sample.
+    measured_call = call
     torch.cuda.synchronize()
     measured_call()
     torch.cuda.synchronize()
@@ -330,6 +327,7 @@ def benchmark_point(
         record_shapes=False,
         profile_memory=False,
         with_stack=False,
+        acc_events=True,
     ) as profiler:
         for _ in range(repeats):
             measured_call()
@@ -369,7 +367,7 @@ def benchmark_point(
                 "up_mfu": round(up_mfu, 6),
                 "down_mfu": round(down_mfu, 6),
                 "total_mfu": round(total_mfu, 6),
-                "profiled_replays": repeats,
+                "profiled_calls": repeats,
                 "profiled_grouped_gemm_kernels": 2 * repeats,
                 "kernel_names": samples["kernel_names"],
                 "weight_dtype": "mxfp4_e2m1",
@@ -426,11 +424,11 @@ def main() -> None:
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument(
         "--execution-mode",
-        choices=("graph", "eager"),
-        default="graph",
+        choices=("eager",),
+        default="eager",
         help=(
-            "Use CUDA Graph replay by default to match SGLang decode. Run an "
-            "eager A/B separately when validating a new FlashInfer build."
+            "Single-kernel lookup generation uses eager launches so the two "
+            "CUTLASS grouped GEMMs are visible as separate profiler events."
         ),
     )
     parser.add_argument(

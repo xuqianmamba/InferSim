@@ -46,7 +46,7 @@ class DSV4DecodeRunnerTest(unittest.TestCase):
                             tp_size=8,
                             ep_size=1,
                             tune_max_num_tokens=16,
-                            execution_mode="graph",
+                            execution_mode="eager",
                         )
                         writer.writerow(row)
 

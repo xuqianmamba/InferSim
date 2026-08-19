@@ -128,7 +128,7 @@ class DSV4SimulatorTest(unittest.TestCase):
             tp_size=8,
             ep_size=1,
             tune_max_num_tokens=16,
-            execution_mode="graph",
+            execution_mode="eager",
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -159,7 +159,7 @@ class DSV4SimulatorTest(unittest.TestCase):
             "backend": "flashinfer_mxfp4_sm90",
             "activation_dtype": "bf16",
             "weight_dtype": "mxfp4_e2m1",
-            "execution_mode": "graph",
+            "execution_mode": "eager",
             "source": "test",
         }
         with mock.patch("layers.moe.get_groupedgemm_decode_perf", return_value=perf), mock.patch(

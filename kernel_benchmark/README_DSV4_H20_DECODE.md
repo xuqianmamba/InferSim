@@ -39,10 +39,12 @@ The MoE benchmark follows SGLang v0.5.17's H20/SM90 W4A16 production call:
 - the actual TP/EP topology (`tp_size=8`, `ep_size=1` for TP8DP1);
 - `tune_max_num_tokens=next_power_of_2(batch_size)` so FlashInfer selects the
   same token-bucket tactic as serving;
-- CUDA Graph replay by default, matching steady-state decode.
+- eager launches, so the two grouped GEMM CUDA kernels remain independently
+  visible to the profiler. CUDA Graph replay is deliberately not used for this
+  single-kernel lookup table.
 
 The benchmark profiles raw CUDA events and requires exactly two matching
-CUTLASS `GroupProblemShape` kernels per replay. It records the first as
+CUTLASS `GroupProblemShape` kernels per eager call. It records the first as
 `up_proj_us` (fused gate/up), the second as `down_proj_us`, and stores their sum
 as `total_latency_us`. Routing, sorting, SwiGLU activation, finalization, and
 kernel gaps are deliberately excluded. `total_mfu` is a diagnostic
@@ -73,7 +75,7 @@ OUT=/home/logs/kaiying/runs/dsv4_h20_decode_$(date +%y%m%d_%H%M%S)
 "$PY" "$REPO/kernel_benchmark/run_dsv4_h20_decode_bench.py" \
   --config-path "$MODEL/config.json" \
   --output-dir "$OUT" \
-  --execution-mode graph \
+  --execution-mode eager \
   --install
 ```
 
@@ -87,16 +89,16 @@ For a short smoke test, use one batch/context point and fewer repeats:
   --kv-lens 40960 \
   --warmup 2 \
   --repeats 5 \
-  --execution-mode graph
+  --execution-mode eager
 ```
 
 The runner exits nonzero if a kernel fails or an expected CSV/row is missing.
 With `--install`, validation finishes before any lookup data is replaced. The
 runner overwrites H20 DSA files and replaces only matching DSV4 TP8DP1 rows in
 `bench_data/grouped_gemm/decode/h20/data.csv`; unrelated rows are preserved.
-Only graph-mode results may be installed. Use `--execution-mode eager` without
-`--install` for a diagnostic A/B; an eager result is never production lookup
-data.
+Only eager single-kernel results may be installed. The benchmark still passes
+the production TP/EP topology and tuning bucket to FlashInfer; graph launch
+overhead and other fused-MoE kernels do not belong in this lookup table.
 
 To refresh only the MoE grouped-GEMM table, without rerunning attention and
 indexer benchmarks:
@@ -108,7 +110,7 @@ indexer benchmarks:
   --batch-sizes 16,24,26,32 \
   --warmup 10 \
   --repeats 50 \
-  --execution-mode graph \
+  --execution-mode eager \
   --moe-only \
   --install
 ```
