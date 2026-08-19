@@ -284,7 +284,7 @@ def get_groupedgemm_decode_perf(
             for row in rows
             if row.get("backend") == "flashinfer_mxfp4_sm90"
             and row.get("weight_dtype") == "mxfp4_e2m1"
-            and row.get("execution_mode") == "graph"
+            and row.get("execution_mode") == "eager"
             and (not row.get("tp_size") or int(row["tp_size"]) == tp_size)
             and (not row.get("ep_size") or int(row["ep_size"]) == ep_size)
         ]

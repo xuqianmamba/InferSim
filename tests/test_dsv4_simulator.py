@@ -137,6 +137,10 @@ class DSV4SimulatorTest(unittest.TestCase):
             with path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fields)
                 writer.writeheader()
+                stale_graph_row = dict(row)
+                stale_graph_row["execution_mode"] = "graph"
+                stale_graph_row["total_latency_us"] = 999.0
+                writer.writerow(stale_graph_row)
                 writer.writerow(row)
             with contextlib.chdir(root):
                 bf16 = get_groupedgemm_decode_perf(
