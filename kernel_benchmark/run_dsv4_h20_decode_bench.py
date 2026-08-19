@@ -124,7 +124,7 @@ def validate_moe(output_dir: Path, expected_rows: int) -> None:
     if len(rows) != expected_rows:
         raise RuntimeError(f"{path} has {len(rows)} rows, expected {expected_rows}")
     for row in rows:
-        if row["kernel_kind"] != "cutlass_grouped_gemm_pair":
+        if row["kernel_kind"] != "cutlass_grouped_gemm_pair_pure_ffi":
             raise RuntimeError(f"unexpected MoE timing semantics in {path}: {row}")
         if abs(
             float(row["total_latency_us"])
@@ -218,7 +218,7 @@ def main() -> None:
         "--execution-mode",
         choices=("eager",),
         default="eager",
-        help="Eager single-kernel profiling mode for the MXFP4 MoE benchmark.",
+        help="Direct CUDA-event timing of each pure grouped-GEMM FFI launch.",
     )
     parser.add_argument(
         "--install",

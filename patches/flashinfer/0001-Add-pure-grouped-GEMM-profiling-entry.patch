@@ -1,0 +1,239 @@
+From 413152d12b7dda1e40c6080d552348ea182445cb Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Wed, 19 Aug 2026 22:32:11 +0800
+Subject: [PATCH] Add pure grouped GEMM profiling entry
+
+---
+ .../cutlass_fused_moe_kernels.cuh             | 43 +++++++++++++++++--
+ .../flashinfer_cutlass_fused_moe_binding.cu   | 25 ++++++++++-
+ .../cutlass_kernels/include/moe_kernels.h     | 16 ++++---
+ 3 files changed, 73 insertions(+), 11 deletions(-)
+
+diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+index 4c5a6ae..d625fa2 100644
+--- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
++++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
+@@ -3059,7 +3059,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+     int64_t const inter_size, int const num_experts_per_node, ActivationParams fc1_activation_type,
+     float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
+     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
++    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++    bool gemm_only) {
++  bool const using_tma_ws_gemm1 = gemm_runner.isTmaWarpSpecialized(config);
++  if (gemm_only) {
++    TLLM_CHECK_WITH_INFO(
++        using_tma_ws_gemm1,
++        "Grouped-GEMM-only profiling is supported only for TMA warp-specialized tactics.");
++  }
++
+   if (fp8_blockscale_gemm_runner) {
+     TLLM_CHECK(!min_latency_mode);
+     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
+@@ -3070,7 +3078,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+     return;
+   }
+ 
+-  bool const using_tma_ws_gemm1 = gemm_runner.isTmaWarpSpecialized(config);
+   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
+   bool const use_ampere_activation_fusion = gemm_runner.isFusedGatedActivation(
+       config, fc1_activation_type.activation_type, inter_size, hidden_size);
+@@ -3131,6 +3138,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+ 
+     sync_check_cuda_error(stream);
+ 
++    // The explicit grouped-GEMM-only profiler must not include SwiGLU,
++    // activation quantization, or any other FC1 post-processing kernel.
++    if (gemm_only) return;
++
+     // TODO: when bias_is_broadcast is false, fuse bias to gemm
+     using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+     bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
+@@ -3292,10 +3303,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+     int64_t const k, float const** alpha_scale_ptr_array, bool use_lora, void* fc2_lora,
+     cudaStream_t stream, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
+     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
++    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++    bool gemm_only) {
+   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
+ 
+   bool const using_tma_ws_gemm2 = gemm_runner.isTmaWarpSpecialized(config);
++  if (gemm_only) {
++    TLLM_CHECK_WITH_INFO(
++        using_tma_ws_gemm2,
++        "Grouped-GEMM-only profiling is supported only for TMA warp-specialized tactics.");
++  }
+ 
+   if (min_latency_mode) {
+     TLLM_CHECK_WITH_INFO(using_tma_ws_gemm2,
+@@ -3317,6 +3334,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+   TmaWarpSpecializedGroupedGemmInput tma_ws_input{};
+   if (using_tma_ws_gemm2) {
+     tma_ws_input = tma_ws_input_template;
++    if (gemm_only) {
++      TLLM_CHECK_WITH_INFO(
++          tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE,
++          "Grouped-GEMM-only profiling requires a tactic without fused finalize.");
++    }
+     if (tma_ws_input.fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE) {
+       // TODO For some reason this has to be done here, it should not overlap with anything else,
+       // but doing it in setupTmaWarpSpecializedInputs gives a different result. Ideally, we want
+@@ -3365,6 +3387,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
+   gemm_runner.moeGemmBiasAct(universal_input, tma_ws_input);
+   sync_check_cuda_error(stream);
+ 
++  // The explicit grouped-GEMM-only profiler must not include routing,
++  // reduction, bias, or final output conversion kernels.
++  if (gemm_only) return;
++
+   if (min_latency_mode) return;
+ 
+   if (use_lora && !fuse_lora_bias) {
+@@ -4899,7 +4925,14 @@ size_t GemmProfilerBackend::getWorkspaceSize(int maxM) {
+ 
+ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tactic,
+                                       char* workspace_ptr_char, void const* expert_weights,
+-                                      bool enable_pdl, cudaStream_t const& stream) {
++                                      bool enable_pdl, cudaStream_t const& stream,
++                                      bool gemm_only) {
++  if (gemm_only) {
++    TLLM_CHECK_WITH_INFO(
++        tactic.is_tma_warp_specialized,
++        "Grouped-GEMM-only profiling is supported only for TMA warp-specialized tactics.");
++  }
++
+   int64_t expanded_num_tokens = original_num_tokens * mK;
+   int64_t num_experts_per_node = mNumExpertsPerNode;
+ 
+@@ -4970,6 +5003,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
+   }
+ 
+   mInterface->is_profiler = true;
++  mInterface->profiler_gemm_only = gemm_only;
+   if (mGemmToProfile == GemmToProfile::GEMM_1) {
+     mInterface->gemm1(input,                                             //
+                       output,                                            //
+@@ -5041,6 +5075,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
+                       active_expert_global_ids,                        //
+                       enable_pdl);                                     //
+   }
++  mInterface->profiler_gemm_only = false;
+   mInterface->is_profiler = false;
+ 
+   sync_check_cuda_error(stream);
+diff --git a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+index 5889682..2391451 100644
+--- a/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
++++ b/csrc/fused_moe/cutlass_backend/flashinfer_cutlass_fused_moe_binding.cu
+@@ -630,7 +630,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+                       int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
+                       int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
+                       int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
+-                      ActivationType activation_type) {
++                      ActivationType activation_type, bool gemm_only = false) {
+     std::lock_guard<std::mutex> lock(mMutex);
+ 
+     // TODO: support profiling under fp8 block scaling in the future
+@@ -706,7 +706,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+ 
+     // Profile specific tactic. Assuming at least one preparation phase has been executed already.
+     mProfiler->runProfiler(num_rows, profile, static_cast<char*>(mProfileWorkspace.data_ptr()),
+-                           expert_weights_ptr, enable_pdl, stream);
++                           expert_weights_ptr, enable_pdl, stream, gemm_only);
+   }
+ 
+   const char* kind() const final { return "fused_moe_runner"; }
+@@ -726,6 +726,27 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
+                            profile_id, do_preparation, enable_pdl,
+                            static_cast<ActivationType>(activation_type));
+           });
++    } else if (name == "run_grouped_gemm_only") {
++      // Same preparation/tactic contract as run_gemm_profile, but the actual
++      // profiled call launches only the selected TMA grouped GEMM. Call once
++      // with do_preparation=true outside the timed region, synchronize, then
++      // reuse the prepared workspace with do_preparation=false for CUDA-event
++      // measurements.
++      return Function::FromTyped(
++          [this](TensorView input, TensorView fc1_expert_weights,
++                 Optional<TensorView> fc1_expert_biases, TensorView fc2_expert_weights,
++                 Optional<TensorView> fc2_expert_biases, int64_t top_k, int64_t tp_size,
++                 int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
++                 int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
++                 int64_t gemm_idx, int64_t profile_id, bool do_preparation, bool enable_pdl,
++                 int64_t activation_type) {
++            runGemmProfile(input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
++                           fc2_expert_biases, top_k, tp_size, tp_rank, ep_size, ep_rank,
++                           cluster_size, cluster_rank, enable_alltoall, min_latency_mode, gemm_idx,
++                           profile_id, do_preparation, enable_pdl,
++                           static_cast<ActivationType>(activation_type),
++                           /*gemm_only=*/true);
++          });
+     } else if (name == "get_tactic_num") {
+       return Function::FromTyped([this]() -> int64_t { return getTacticNum(); });
+     } else if (name == "get_gemm1_tactic_count") {
+diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+index 429626b..0f48475 100644
+--- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
++++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
+@@ -542,6 +542,9 @@ class CutlassMoeFCRunnerInterface {
+   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const = 0;
+ 
+   bool is_profiler = false;
++  // Set only by run_grouped_gemm_only.  Production runMoe calls leave this
++  // false, preserving the normal activation/finalize behavior.
++  bool profiler_gemm_only = false;
+   bool use_fused_finalize_ = true;
+ };
+ 
+@@ -705,7 +708,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+                     ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
+                     bool bias_is_broadcast, cudaStream_t stream,
+                     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
+-                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
++                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
++                    bool gemm_only = false);
+ 
+   static void gemm2(
+       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX>& gemm_runner,
+@@ -726,7 +730,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+       void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
+       bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config,
+       bool min_latency_mode, int* num_active_experts_per, int* active_expert_global_ids,
+-      bool enable_pdl);
++      bool enable_pdl, bool gemm_only = false);
+ 
+   // Overrides to allow us to forward on to the internal functions with the pointers using the
+   // correct type
+@@ -755,7 +759,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+                        expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
+                        fc1_activation_type, alpha_scale_ptr_array, bias_is_broadcast, stream,
+                        config, min_latency_mode, num_active_experts_per, active_expert_global_ids,
+-                       enable_pdl);
++                        enable_pdl, /*gemm_only=*/is_profiler && profiler_gemm_only);
+   }
+ 
+   void gemm2(void const* const input, void* const gemm_output, void* const final_output,
+@@ -790,7 +794,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
+         num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
+         inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array, use_lora,
+         fc2_lora, stream, parallelism_config, enable_alltoall, config, min_latency_mode,
+-        num_active_experts_per, active_expert_global_ids, enable_pdl);
++        num_active_experts_per, active_expert_global_ids, enable_pdl,
++        /*gemm_only=*/is_profiler && profiler_gemm_only);
+   }
+ 
+   virtual size_t getGemmWorkspaceSize(int num_experts_per_node) const override {
+@@ -1078,7 +1083,8 @@ struct GemmProfilerBackend {
+   size_t getWorkspaceSize(int maxM);
+ 
+   void runProfiler(int num_tokens, Config const& tactic, char* workspace_ptr_char,
+-                   void const* expert_weights, bool enable_pdl, cudaStream_t const& stream);
++                   void const* expert_weights, bool enable_pdl, cudaStream_t const& stream,
++                   bool gemm_only = false);
+ 
+   CutlassMoeFCRunnerInterface* mInterface;
+ 
+-- 
+2.53.0.windows.3
+

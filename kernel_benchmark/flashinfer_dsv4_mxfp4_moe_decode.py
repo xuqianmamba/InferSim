@@ -1,16 +1,11 @@
-"""Benchmark DeepSeek-V4's production FlashInfer MXFP4 grouped GEMMs.
+"""Benchmark the two DeepSeek-V4 MXFP4 grouped GEMMs directly.
 
-The profiled call mirrors SGLang v0.5.17's SM90 ``flashinfer_mxfp4`` operator,
-including its TP/EP topology and token-count tuning bucket.  It is launched in
-eager mode so the profiler can observe each CUDA kernel independently. Routing,
-random tensor creation, and FlashInfer's SM90 weight/scale interleave are
-deliberately outside the timed region.
-
-The lookup intentionally records only the two CUTLASS grouped GEMMs launched
-by ``cutlass_fused_moe``: gate/up (FC1) and down (FC2).  Routing, sorting,
-activation, finalization, and gaps between kernels are outside this lookup
-latency.  This matches InferSim's grouped-GEMM table contract and avoids
-mistaking the complete fused-operator span for each individual projection.
+This benchmark calls FlashInfer's patched ``run_grouped_gemm_only`` FFI entry.
+FC1 stops immediately after the gate/up CUTLASS grouped GEMM and FC2 stops
+immediately after the down-projection CUTLASS grouped GEMM.  There is no SGLang
+server, CUDA graph, Nsight, torch profiler, SwiGLU, routing finalize, or fused
+MoE span in the recorded latency.  Routing/workspace preparation and SM90
+weight interleave happen outside the CUDA-event timing region.
 """
 
 from __future__ import annotations
@@ -346,6 +341,115 @@ def prepare_weights(experts: int, hidden: int, intermediate: int):
     )
 
 
+def create_grouped_gemm_runner():
+    """Build/load the benchmark-only SM90 FFI and construct its runner."""
+    from flashinfer_grouped_gemm_only_jit import load_grouped_gemm_only_module
+
+    module = load_grouped_gemm_only_module()
+    runner = module.init(
+        torch.bfloat16,
+        torch.uint8,
+        torch.bfloat16,
+        False,  # use_deepseek_fp8_block_scale
+        True,  # use_w4_group_scaling (BF16 x MXFP4)
+        False,  # use_mxfp8_act_scaling
+        False,  # input weights are already SM90-interleaved
+        False,  # never request fused finalize in the benchmark runner
+    )
+    if not hasattr(runner, "run_grouped_gemm_only"):
+        raise RuntimeError("benchmark-only FlashInfer FFI was not loaded")
+    return runner
+
+
+def tactic_ids_for_stage(runner, stage: int) -> list[int]:
+    gemm1_count = int(runner.get_gemm1_tactic_count())
+    gemm2_count = int(runner.get_gemm2_tactic_count())
+    if stage == 1:
+        candidates = range(gemm1_count)
+    elif stage == 2:
+        candidates = range(gemm1_count, gemm1_count + gemm2_count)
+    else:
+        raise ValueError(f"invalid grouped GEMM stage: {stage}")
+    result = []
+    for tactic in candidates:
+        try:
+            if int(runner.get_tactic_occupancy(tactic)) > 0:
+                result.append(tactic)
+        except Exception:
+            result.append(tactic)
+    return result
+
+
+def measure_grouped_gemm_stage(
+    runner,
+    hidden_states: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    shape: dict[str, object],
+    stage: int,
+    warmup: int,
+    repeats: int,
+) -> tuple[float, int, list[float]]:
+    """Autotune and time exactly one grouped GEMM using CUDA events."""
+    from flashinfer.fused_moe.core import ActivationType
+
+    def launch(tactic: int, prepare: bool) -> None:
+        runner.run_grouped_gemm_only(
+            hidden_states,
+            w13,
+            None,
+            w2,
+            None,
+            shape["topk"],
+            shape["tp_size"],
+            0,
+            shape["ep_size"],
+            0,
+            1,
+            0,
+            False,
+            False,
+            stage,
+            tactic,
+            prepare,
+            False,
+            ActivationType.Swiglu,
+        )
+
+    valid: list[tuple[float, int, list[float]]] = []
+    errors: list[str] = []
+    for tactic in tactic_ids_for_stage(runner, stage):
+        try:
+            # The profiler-style preparation creates routing, offsets, TMA
+            # descriptors, scales, and workspace outside the timed region.
+            launch(tactic, True)
+            torch.cuda.synchronize()
+            for _ in range(warmup):
+                launch(tactic, False)
+            torch.cuda.synchronize()
+
+            samples = []
+            for _ in range(repeats):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                launch(tactic, False)
+                end.record()
+                end.synchronize()
+                samples.append(float(start.elapsed_time(end)) * 1_000.0)
+            valid.append((statistics.median(samples), tactic, samples))
+        except Exception as error:
+            torch.cuda.synchronize()
+            errors.append(f"tactic={tactic}: {error}")
+
+    if not valid:
+        raise RuntimeError(
+            f"no valid TMA grouped-GEMM tactic for stage {stage}; "
+            + "; ".join(errors)
+        )
+    return min(valid, key=lambda item: item[0])
+
+
 def benchmark_point(
     tokens: int,
     shape: dict[str, object],
@@ -355,10 +459,6 @@ def benchmark_point(
     peak_tflops: float,
     execution_mode: str,
 ) -> dict:
-    from flashinfer.fused_moe import cutlass_fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-    from torch.profiler import ProfilerActivity, profile
-
     generator = torch.Generator(device="cuda").manual_seed(4321 + tokens)
     hidden_states = torch.randn(
         tokens,
@@ -370,82 +470,26 @@ def benchmark_point(
     topk_weights, topk_ids, routing_stats = make_topk(
         tokens, shape["num_local_experts"], shape["topk"]
     )
-    output = torch.empty_like(hidden_states)
     w13, w2, w13_scale, w2_scale = weights
-    swiglu_limit = None
-    if shape["swiglu_limit"] is not None:
-        swiglu_limit = torch.full(
-            (shape["num_local_experts"],),
-            float(shape["swiglu_limit"]),
-            dtype=torch.float32,
-            device="cuda",
-        )
     tune_max_num_tokens = next_power_of_2(tokens)
-
-    def call() -> None:
-        cutlass_fused_moe(
-            input=hidden_states,
-            token_selected_experts=topk_ids,
-            token_final_scales=topk_weights,
-            fc1_expert_weights=w13,
-            fc2_expert_weights=w2,
-            output_dtype=torch.bfloat16,
-            quant_scales=[w13_scale, w2_scale],
-            input_sf=None,
-            fc1_expert_biases=None,
-            fc2_expert_biases=None,
-            swiglu_alpha=None,
-            swiglu_beta=None,
-            swiglu_limit=swiglu_limit,
-            tp_size=shape["tp_size"],
-            tp_rank=0,
-            ep_size=shape["ep_size"],
-            ep_rank=0,
-            use_w4_group_scaling=True,
-            use_mxfp8_act_scaling=False,
-            activation_type=ActivationType.Swiglu,
-            tune_max_num_tokens=tune_max_num_tokens,
-            output=output,
-        )
-
-    for _ in range(warmup):
-        call()
-    torch.cuda.synchronize()
 
     if execution_mode != "eager":
         raise ValueError(
-            "grouped-GEMM lookup generation requires eager mode so individual "
-            "CUDA kernels remain visible to the profiler"
+            "grouped-GEMM lookup generation uses direct eager FFI launches"
         )
 
-    # Keep one extra eager call outside the formal profiler region so any
-    # lazy tactic/kernel initialization cannot affect the first sample.
-    measured_call = call
-    torch.cuda.synchronize()
-    measured_call()
-    torch.cuda.synchronize()
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=False,
-        profile_memory=False,
-        with_stack=False,
-        acc_events=True,
-    ) as profiler:
-        for _ in range(repeats):
-            measured_call()
-        torch.cuda.synchronize()
-
-    low_level_profiler = getattr(profiler, "profiler", None)
-    kineto_results = getattr(low_level_profiler, "kineto_results", None)
-    kineto_events = (
-        kineto_results.events() if kineto_results is not None else ()
+    # The patched runner's profiler preparation creates the exact grouped
+    # problem shape and synthetic routing used by FlashInfer's tactic tuner.
+    # topk tensors/scales above are used only to report deterministic routing
+    # statistics; they are deliberately not in either timed kernel call.
+    del topk_weights, topk_ids, w13_scale, w2_scale
+    runner = create_grouped_gemm_runner()
+    up_latency_us, up_tactic, up_samples = measure_grouped_gemm_stage(
+        runner, hidden_states, w13, w2, shape, 1, warmup, repeats
     )
-    samples = extract_grouped_gemm_samples(
-        profiler.events(), repeats, kineto_events=kineto_events
+    down_latency_us, down_tactic, down_samples = measure_grouped_gemm_stage(
+        runner, hidden_states, w13, w2, shape, 2, warmup, repeats
     )
-    up_latency_us = float(samples["up_median_us"])
-    down_latency_us = float(samples["down_median_us"])
     total_latency_us = up_latency_us + down_latency_us
 
     # Gate/up is two HxI GEMMs; down is one IxH GEMM.  Report their useful
@@ -477,10 +521,12 @@ def benchmark_point(
                 "up_mfu": round(up_mfu, 6),
                 "down_mfu": round(down_mfu, 6),
                 "total_mfu": round(total_mfu, 6),
-                "profiled_calls": repeats,
-                "profiled_grouped_gemm_kernels": 2 * repeats,
-                "kernel_names": samples["kernel_names"],
-                "kernel_event_source": samples["kernel_event_source"],
+                "measured_calls_per_stage": repeats,
+                "up_tactic": up_tactic,
+                "down_tactic": down_tactic,
+                "up_samples_us": [round(value, 3) for value in up_samples],
+                "down_samples_us": [round(value, 3) for value in down_samples],
+                "timing": "cuda_event_pure_grouped_gemm_ffi",
                 "weight_dtype": "mxfp4_e2m1",
                 "activation_dtype": "bf16",
                 "tp_size": shape["tp_size"],
@@ -508,7 +554,7 @@ def benchmark_point(
         "down_mfu": round(down_mfu, 6),
         "total_latency_us": round(total_latency_us, 3),
         "total_mfu": round(total_mfu, 6),
-        "kernel_kind": "cutlass_grouped_gemm_pair",
+        "kernel_kind": "cutlass_grouped_gemm_pair_pure_ffi",
         "backend": "flashinfer_mxfp4_sm90",
         "activation_dtype": "bf16",
         "weight_dtype": "mxfp4_e2m1",
@@ -538,8 +584,8 @@ def main() -> None:
         choices=("eager",),
         default="eager",
         help=(
-            "Single-kernel lookup generation uses eager launches so the two "
-            "CUTLASS grouped GEMMs are visible as separate profiler events."
+            "Direct eager FFI launches timed separately with CUDA events; "
+            "no profiler or CUDA graph is used."
         ),
     )
     parser.add_argument(
