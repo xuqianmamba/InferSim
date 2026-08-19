@@ -1,12 +1,19 @@
 import contextlib
 import csv
 import io
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from config.model_config import ModelConfig
 from layers.attn import DSA
-from mfu.mfu import get_dsa_decode_perf, get_dsa_indexer_decode_perf
+from layers.moe import MoE
+from mfu.mfu import (
+    get_dsa_decode_perf,
+    get_dsa_indexer_decode_perf,
+    get_groupedgemm_decode_perf,
+)
 from models.model import get_dsv4_runtime_layer_latency_us
 
 
@@ -87,6 +94,80 @@ class DSV4SimulatorTest(unittest.TestCase):
         )
         expected = (30 * 636.574 + 31 * 573.050) / 61
         self.assertAlmostEqual(latency_us, expected, places=6)
+
+    def test_fused_mxfp4_lookup_returns_direct_latency(self):
+        fields = (
+            "num_experts,num_gpus,num_local_experts,topk,hidden_size,"
+            "intermediate_size,batch_size_per_gpu,tokens_per_expert,"
+            "up_proj_us,up_mfu,down_proj_us,down_mfu,total_latency_us,"
+            "total_mfu,kernel_kind,backend,activation_dtype,weight_dtype,"
+            "mfu_peak_tflops,tp_size,ep_size,tune_max_num_tokens,"
+            "execution_mode,active_experts,max_tokens_per_expert,"
+            "routing_mode,swiglu_limit"
+        ).split(",")
+        row = dict.fromkeys(fields, "")
+        row.update(
+            num_experts=384,
+            num_gpus=8,
+            num_local_experts=384,
+            topk=6,
+            hidden_size=7168,
+            intermediate_size=384,
+            batch_size_per_gpu=16,
+            tokens_per_expert=0,
+            up_proj_us=321.5,
+            up_mfu=0.033,
+            down_proj_us=321.5,
+            down_mfu=0.033,
+            total_latency_us=321.5,
+            total_mfu=0.033,
+            kernel_kind="fused_gate_up_swiglu_down",
+            backend="flashinfer_mxfp4_sm90",
+            activation_dtype="bf16",
+            weight_dtype="mxfp4_e2m1",
+            tp_size=8,
+            ep_size=1,
+            tune_max_num_tokens=16,
+            execution_mode="graph",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "bench_data/grouped_gemm/decode/h20/data.csv"
+            path.parent.mkdir(parents=True)
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(row)
+            with contextlib.chdir(root):
+                bf16 = get_groupedgemm_decode_perf(
+                    self.config, 16, "H20", 8, False, 8
+                )
+                fp8_flag = get_groupedgemm_decode_perf(
+                    self.config, 16, "H20", 8, True, 8
+                )
+        self.assertAlmostEqual(bf16["total_latency_s"] * 1e6, 321.5)
+        self.assertEqual(bf16["total_latency_s"], fp8_flag["total_latency_s"])
+        self.assertEqual(bf16["weight_dtype"], "mxfp4_e2m1")
+
+    def test_fused_mxfp4_latency_already_includes_weight_loading(self):
+        perf = {
+            "up_mfu": 0.033,
+            "down_mfu": 0.033,
+            "total_mfu": 0.033,
+            "total_latency_s": 321.5e-6,
+            "kernel_kind": "fused_gate_up_swiglu_down",
+            "backend": "flashinfer_mxfp4_sm90",
+            "activation_dtype": "bf16",
+            "weight_dtype": "mxfp4_e2m1",
+            "execution_mode": "graph",
+            "source": "test",
+        }
+        with mock.patch("layers.moe.get_groupedgemm_decode_perf", return_value=perf), mock.patch(
+            "layers.moe.load_moe_weights_time", return_value=1.0
+        ), mock.patch("layers.moe.get_gemm_perf", return_value=(0.1, 0.0)):
+            with contextlib.redirect_stdout(io.StringIO()):
+                latency = MoE(self.config, False, 8).decode_moe(16, "H20", 8)
+        self.assertAlmostEqual(latency, 321.5e-6)
 
 
 if __name__ == "__main__":

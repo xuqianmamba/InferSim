@@ -1,8 +1,13 @@
 """Benchmark DeepSeek-V4's production FlashInfer MXFP4 fused-MoE kernel.
 
-The timed region is the same ``cutlass_fused_moe`` call used by SGLang's
-``flashinfer_mxfp4`` runner.  Routing, random tensor creation, and FlashInfer's
-SM90 weight/scale interleave are deliberately outside the timed region.
+The timed region mirrors SGLang v0.5.17's SM90 ``flashinfer_mxfp4`` call,
+including its TP/EP topology and token-count tuning bucket.  Routing, random
+tensor creation, and FlashInfer's SM90 weight/scale interleave are deliberately
+outside the timed region.
+
+The generated lookup row records the fused operator latency directly.  The
+legacy up/down columns remain only so existing InferSim tables stay readable;
+they must not be interpreted as two separately measured projections.
 """
 
 from __future__ import annotations
@@ -30,10 +35,33 @@ CSV_FIELDS = (
     "up_mfu",
     "down_proj_us",
     "down_mfu",
+    "total_latency_us",
+    "total_mfu",
+    "kernel_kind",
+    "backend",
+    "activation_dtype",
+    "weight_dtype",
+    "mfu_peak_tflops",
+    "tp_size",
+    "ep_size",
+    "tune_max_num_tokens",
+    "execution_mode",
+    "active_experts",
+    "max_tokens_per_expert",
+    "routing_mode",
+    "swiglu_limit",
 )
 
 
-def load_shape(config_path: str | Path, world_size: int, tp_size: int) -> dict[str, int]:
+def next_power_of_2(value: int) -> int:
+    if value <= 0:
+        raise ValueError("value must be positive")
+    return 1 << (value - 1).bit_length()
+
+
+def load_shape(
+    config_path: str | Path, world_size: int, tp_size: int
+) -> dict[str, object]:
     config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     if world_size % tp_size:
         raise ValueError("world_size must be divisible by tp_size")
@@ -56,17 +84,26 @@ def load_shape(config_path: str | Path, world_size: int, tp_size: int) -> dict[s
         "world_size": world_size,
         "tp_size": tp_size,
         "ep_size": ep_size,
+        "swiglu_limit": config.get("swiglu_limit"),
     }
 
 
-def make_topk(tokens: int, experts: int, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
+def make_topk(
+    tokens: int, experts: int, topk: int
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
     generator = torch.Generator(device="cuda").manual_seed(1235 + tokens)
     logits = torch.randn(
         tokens, experts, dtype=torch.float32, device="cuda", generator=generator
     )
     weights, ids = torch.topk(torch.softmax(logits, dim=-1), topk, dim=-1)
     weights = weights / weights.sum(dim=-1, keepdim=True)
-    return weights.to(torch.float32), ids.to(torch.int32)
+    ids = ids.to(torch.int32)
+    counts = torch.bincount(ids.flatten(), minlength=experts)
+    stats = {
+        "active_experts": int((counts > 0).sum().item()),
+        "max_tokens_per_expert": int(counts.max().item()),
+    }
+    return weights.to(torch.float32), ids, stats
 
 
 def prepare_weights(experts: int, hidden: int, intermediate: int):
@@ -134,11 +171,12 @@ def prepare_weights(experts: int, hidden: int, intermediate: int):
 
 def benchmark_point(
     tokens: int,
-    shape: dict[str, int],
+    shape: dict[str, object],
     weights,
     warmup: int,
     repeats: int,
     peak_tflops: float,
+    execution_mode: str,
 ) -> dict:
     from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
@@ -151,11 +189,20 @@ def benchmark_point(
         device="cuda",
         generator=generator,
     )
-    topk_weights, topk_ids = make_topk(
+    topk_weights, topk_ids, routing_stats = make_topk(
         tokens, shape["num_local_experts"], shape["topk"]
     )
     output = torch.empty_like(hidden_states)
     w13, w2, w13_scale, w2_scale = weights
+    swiglu_limit = None
+    if shape["swiglu_limit"] is not None:
+        swiglu_limit = torch.full(
+            (shape["num_local_experts"],),
+            float(shape["swiglu_limit"]),
+            dtype=torch.float32,
+            device="cuda",
+        )
+    tune_max_num_tokens = next_power_of_2(tokens)
 
     def call() -> None:
         cutlass_fused_moe(
@@ -166,25 +213,45 @@ def benchmark_point(
             fc2_expert_weights=w2,
             output_dtype=torch.bfloat16,
             quant_scales=[w13_scale, w2_scale],
+            input_sf=None,
             fc1_expert_biases=None,
             fc2_expert_biases=None,
             swiglu_alpha=None,
             swiglu_beta=None,
-            swiglu_limit=None,
+            swiglu_limit=swiglu_limit,
+            tp_size=shape["tp_size"],
+            tp_rank=0,
+            ep_size=shape["ep_size"],
+            ep_rank=0,
             use_w4_group_scaling=True,
+            use_mxfp8_act_scaling=False,
             activation_type=ActivationType.Swiglu,
+            tune_max_num_tokens=tune_max_num_tokens,
             output=output,
         )
 
     for _ in range(warmup):
         call()
     torch.cuda.synchronize()
+
+    if execution_mode == "graph":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            call()
+        measured_call = graph.replay
+    elif execution_mode == "eager":
+        measured_call = call
+    else:
+        raise ValueError(f"unsupported execution mode: {execution_mode}")
+
+    # Ensure graph capture itself is outside the measured samples.
+    torch.cuda.synchronize()
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     samples = []
     for _ in range(repeats):
         start.record()
-        call()
+        measured_call()
         end.record()
         end.synchronize()
         samples.append(start.elapsed_time(end) * 1000.0)
@@ -208,6 +275,13 @@ def benchmark_point(
                 "latency_us": round(latency_us, 3),
                 "achieved_tflops": round(achieved_tflops, 3),
                 "mfu": round(mfu, 6),
+                "weight_dtype": "mxfp4_e2m1",
+                "activation_dtype": "bf16",
+                "tp_size": shape["tp_size"],
+                "ep_size": shape["ep_size"],
+                "tune_max_num_tokens": tune_max_num_tokens,
+                "execution_mode": execution_mode,
+                **routing_stats,
             }
         )
     )
@@ -222,13 +296,28 @@ def benchmark_point(
         "tokens_per_expert": round(
             tokens * shape["topk"] / shape["num_local_experts"]
         ),
-        # The fused call cannot attribute elapsed time to FC1/FC2 separately.
-        # Keep the established InferSim convention: store combined latency and
-        # combined useful MFU in both columns; the simulator consumes max(MFU).
+        # Deprecated compatibility fields.  This is one fused measurement, not
+        # two separately timed projections.  New consumers use total_latency_us.
         "up_proj_us": round(latency_us, 3),
         "up_mfu": round(mfu, 6),
         "down_proj_us": round(latency_us, 3),
         "down_mfu": round(mfu, 6),
+        "total_latency_us": round(latency_us, 3),
+        "total_mfu": round(mfu, 6),
+        "kernel_kind": "fused_gate_up_swiglu_down",
+        "backend": "flashinfer_mxfp4_sm90",
+        "activation_dtype": "bf16",
+        "weight_dtype": "mxfp4_e2m1",
+        "mfu_peak_tflops": peak_tflops,
+        "tp_size": shape["tp_size"],
+        "ep_size": shape["ep_size"],
+        "tune_max_num_tokens": tune_max_num_tokens,
+        "execution_mode": execution_mode,
+        **routing_stats,
+        "routing_mode": "synthetic_uniform_softmax",
+        "swiglu_limit": (
+            "" if shape["swiglu_limit"] is None else shape["swiglu_limit"]
+        ),
     }
 
 
@@ -240,6 +329,15 @@ def main() -> None:
     parser.add_argument("--batch-sizes", default="16,24,26,32")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument(
+        "--execution-mode",
+        choices=("graph", "eager"),
+        default="graph",
+        help=(
+            "Use CUDA Graph replay by default to match SGLang decode. Run an "
+            "eager A/B separately when validating a new FlashInfer build."
+        ),
+    )
     parser.add_argument(
         "--peak-tflops",
         type=float,
@@ -260,7 +358,13 @@ def main() -> None:
     )
     rows = [
         benchmark_point(
-            batch, shape, weights, args.warmup, args.repeats, args.peak_tflops
+            batch,
+            shape,
+            weights,
+            args.warmup,
+            args.repeats,
+            args.peak_tflops,
+            args.execution_mode,
         )
         for batch in batch_sizes
     ]

@@ -1,7 +1,7 @@
 from flops.flops import gemm_flops
 from hardware.gpu import TFLOPS_TO_GFLOPS, gpu_map
 from layers.attn import get_gemm_mfu_and_latency, get_gemm_perf
-from mfu.mfu import (get_gemm_mfu, get_groupedgemm_decode_mfu,
+from mfu.mfu import (get_gemm_mfu, get_groupedgemm_decode_perf,
                      get_groupedgemm_prefill_mfu)
 from params.params import get_expected_active_experts, load_moe_weights_time
 
@@ -33,12 +33,22 @@ class MoE:
         )
         routed_experts_gflops *= bs * self.config.num_experts_per_tok * 3.0 / 1e9
 
+        measured_fused_latency = False
+        decode_perf = None
         if self.config.is_moe:
-            routed_experts_mfu = max(
-                get_groupedgemm_decode_mfu(
-                    self.config, bs, device_type, num_gpus, self.use_fp8_gemm, self.tp_size
-                )
+            decode_perf = get_groupedgemm_decode_perf(
+                self.config,
+                bs,
+                device_type,
+                num_gpus,
+                self.use_fp8_gemm,
+                self.tp_size,
             )
+            routed_experts_mfu = decode_perf["total_mfu"]
+            if routed_experts_mfu is None:
+                routed_experts_mfu = max(
+                    decode_perf["up_mfu"], decode_perf["down_mfu"]
+                )
         else:  # Dense FFN is treated as a special 1-expert MoE
             routed_experts_mfu = get_gemm_mfu(
                 device_type,
@@ -47,13 +57,20 @@ class MoE:
                 self.config.intermediate_size * 2 // num_gpus,
             )
 
-        routed_experts_latency = routed_experts_gflops / (
-            gpu.fp16_tflops * TFLOPS_TO_GFLOPS * routed_experts_mfu
-        )
-        if self.use_fp8_gemm:
+        if decode_perf is not None and decode_perf["total_latency_s"] is not None:
+            # This is a direct timing of the complete W4A16 fused operator.
+            # It already includes both expert GEMMs, activation, dequantization,
+            # and weight reads; do not rescale it with a generic FP16/FP8 peak.
+            routed_experts_latency = decode_perf["total_latency_s"]
+            measured_fused_latency = True
+        else:
             routed_experts_latency = routed_experts_gflops / (
-                gpu.fp8_tflops * TFLOPS_TO_GFLOPS * routed_experts_mfu
+                gpu.fp16_tflops * TFLOPS_TO_GFLOPS * routed_experts_mfu
             )
+            if self.use_fp8_gemm:
+                routed_experts_latency = routed_experts_gflops / (
+                    gpu.fp8_tflops * TFLOPS_TO_GFLOPS * routed_experts_mfu
+                )
 
         active_experts = get_expected_active_experts(
             self.config, num_gpus, self.tp_size, bs
@@ -67,6 +84,19 @@ class MoE:
             num_tokens=bs,
         )
         print("{:<40} {:<10.2f}".format("Routed experts/FFN MFU:", routed_experts_mfu))
+        if measured_fused_latency:
+            print(
+                "{:<40} {:<10}".format(
+                    "Routed experts benchmark:",
+                    f"{decode_perf['backend']} {decode_perf['execution_mode']}",
+                )
+            )
+            print(
+                "{:<40} {:<10}".format(
+                    "Routed experts precision:",
+                    f"{decode_perf['activation_dtype']}x{decode_perf['weight_dtype']}",
+                )
+            )
         print("{:<40} {:<10.2f}".format("Expected active experts:", active_experts))
         print(
             "{:<40} {:<10.2f}".format(
@@ -75,10 +105,16 @@ class MoE:
         )
         print(
             "{:<40} {:<10.2f}".format(
-                "Experts loading latency (us):", moe_load_time * 1e6
+                "Experts loading lower bound (us):", moe_load_time * 1e6
             )
         )
-        t = max(routed_experts_latency, moe_load_time)
+        # A direct fused-kernel timing already contains its weight traffic.
+        # Legacy analytical rows still use max(compute, weight-load roofline).
+        t = (
+            routed_experts_latency
+            if measured_fused_latency
+            else max(routed_experts_latency, moe_load_time)
+        )
 
         if self.config.num_shared_experts > 0:
             # TP shards intermediate_size; hidden_size is NOT sharded

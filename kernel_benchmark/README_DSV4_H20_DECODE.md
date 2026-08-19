@@ -29,8 +29,31 @@ The default matrix covers the observed TP8DP1 serving shapes:
 - `logits-64-128.csv`: compatibility table for the DeepGEMM logits kernel.
 - `indexer-64-128-topk1024.csv`: logits, top-k, and combined indexer latency.
 - `groupedgemm-decode-dsv4-tp8dp1.csv`: production
-  `flashinfer_mxfp4` fused routed-MoE latency and useful MFU (384 experts,
-  top-k 6, hidden 7168, TP-sharded intermediate size 384).
+  `flashinfer_mxfp4` fused routed-MoE latency and diagnostic useful MFU (384
+  experts, top-k 6, hidden 7168, TP-sharded intermediate size 384).
+
+The MoE benchmark follows SGLang v0.5.17's H20/SM90 W4A16 production call:
+
+- BF16 activation and output, MXFP4 E2M1 packed expert weights, and E8M0
+  group scales;
+- the actual TP/EP topology (`tp_size=8`, `ep_size=1` for TP8DP1);
+- `tune_max_num_tokens=next_power_of_2(batch_size)` so FlashInfer selects the
+  same token-bucket tactic as serving;
+- CUDA Graph replay by default, matching steady-state decode.
+
+The generated MoE CSV stores `total_latency_us` for the complete fused
+gate/up + SwiGLU + down operator. That measured latency is authoritative in
+InferSim and is not converted back through a generic FP16/FP8 peak. The
+historical `up_proj_*` and `down_proj_*` columns are retained for table
+compatibility only; they are deprecated for fused rows and must not be added
+together. `total_mfu` is a diagnostic useful-FLOP normalization, not a claim
+about the native MXFP4 hardware peak.
+
+Routing IDs in this microbenchmark use a deterministic synthetic distribution.
+The CSV records its active-expert and maximum-expert-load statistics. If an
+Nsys production trace shows materially different routing skew, replaying
+captured routing tensors is the next calibration step; do not compensate by
+manually fitting the reported latency.
 
 The attention CSV `kv_len` is the original full-context length. The logits
 compatibility CSV `s_kv` is the C4-compressed length actually seen by the
@@ -51,6 +74,7 @@ OUT=/home/logs/kaiying/runs/dsv4_h20_decode_$(date +%y%m%d_%H%M%S)
 "$PY" "$REPO/kernel_benchmark/run_dsv4_h20_decode_bench.py" \
   --config-path "$MODEL/config.json" \
   --output-dir "$OUT" \
+  --execution-mode graph \
   --install
 ```
 
@@ -64,10 +88,13 @@ For a short smoke test, use one batch/context point and fewer repeats:
   --kv-lens 40960 \
   --warmup 2 \
   --repeats 5 \
-  --install
+  --execution-mode graph
 ```
 
 The runner exits nonzero if a kernel fails or an expected CSV/row is missing.
 With `--install`, validation finishes before any lookup data is replaced. The
 runner overwrites H20 DSA files and replaces only matching DSV4 TP8DP1 rows in
 `bench_data/grouped_gemm/decode/h20/data.csv`; unrelated rows are preserved.
+Only graph-mode results may be installed. Use `--execution-mode eager` without
+`--install` for a diagnostic A/B; an eager result is never production lookup
+data.

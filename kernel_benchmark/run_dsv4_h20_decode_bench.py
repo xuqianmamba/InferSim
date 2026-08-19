@@ -10,6 +10,39 @@ import subprocess
 import sys
 from pathlib import Path
 
+LEGACY_MOE_FIELDS = (
+    "num_experts",
+    "num_gpus",
+    "num_local_experts",
+    "topk",
+    "hidden_size",
+    "intermediate_size",
+    "batch_size_per_gpu",
+    "tokens_per_expert",
+    "up_proj_us",
+    "up_mfu",
+    "down_proj_us",
+    "down_mfu",
+)
+
+MOE_FIELDS = LEGACY_MOE_FIELDS + (
+    "total_latency_us",
+    "total_mfu",
+    "kernel_kind",
+    "backend",
+    "activation_dtype",
+    "weight_dtype",
+    "mfu_peak_tflops",
+    "tp_size",
+    "ep_size",
+    "tune_max_num_tokens",
+    "execution_mode",
+    "active_experts",
+    "max_tokens_per_expert",
+    "routing_mode",
+    "swiglu_limit",
+)
+
 MATRIX_FILES = {
     "attn-64-512-c4.csv": (
         "dtype",
@@ -43,20 +76,7 @@ MATRIX_FILES = {
         "latency_us",
         "mfu",
     ),
-    "groupedgemm-decode-dsv4-tp8dp1.csv": (
-        "num_experts",
-        "num_gpus",
-        "num_local_experts",
-        "topk",
-        "hidden_size",
-        "intermediate_size",
-        "batch_size_per_gpu",
-        "tokens_per_expert",
-        "up_proj_us",
-        "up_mfu",
-        "down_proj_us",
-        "down_mfu",
-    ),
+    "groupedgemm-decode-dsv4-tp8dp1.csv": MOE_FIELDS,
 }
 
 
@@ -113,20 +133,27 @@ def install_results(output_dir: Path, repository: Path) -> None:
 
     replace_key = tuple(new_rows[0][field] for field in fields[:6])
     kept_rows = []
+    old_fields = ()
     if target.is_file():
         with target.open(newline="", encoding="utf-8") as handle:
             old_reader = csv.DictReader(handle)
-            if tuple(old_reader.fieldnames or ()) != fields:
-                raise RuntimeError(f"unexpected existing MoE fields in {target}")
+            old_fields = tuple(old_reader.fieldnames or ())
+            missing_legacy = set(LEGACY_MOE_FIELDS) - set(old_fields)
+            if missing_legacy:
+                raise RuntimeError(
+                    f"existing MoE table lacks legacy fields {missing_legacy}: {target}"
+                )
             for row in old_reader:
                 key = tuple(row[field] for field in fields[:6])
                 if key != replace_key:
                     kept_rows.append(row)
 
+    # New optional columns are appended without breaking historical rows.
+    output_fields = fields + tuple(field for field in old_fields if field not in fields)
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".tmp")
     with temporary.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
+        writer = csv.DictWriter(handle, fieldnames=output_fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(kept_rows + new_rows)
     os.replace(temporary, target)
@@ -142,11 +169,19 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument(
+        "--execution-mode",
+        choices=("graph", "eager"),
+        default="graph",
+        help="Execution mode for the MXFP4 MoE benchmark.",
+    )
+    parser.add_argument(
         "--install",
         action="store_true",
         help="Overwrite the repository's validated H20 DSV4 lookup data.",
     )
     args = parser.parse_args()
+    if args.install and args.execution_mode != "graph":
+        raise SystemExit("only graph-mode MoE results may be installed")
 
     script_dir = Path(__file__).resolve().parent
     output_dir = Path(args.output_dir).resolve()
@@ -199,6 +234,8 @@ def main() -> None:
             str(args.warmup),
             "--repeats",
             str(args.repeats),
+            "--execution-mode",
+            args.execution_mode,
             "--output-dir",
             str(output_dir),
         ]

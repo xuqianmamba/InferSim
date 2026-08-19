@@ -212,44 +212,116 @@ def get_attn_prefill_mfu(config, seq_len, device_type, tp_size):
     return round(mfu, 6)
 
 
-def get_groupedgemm_decode_mfu(config, target_bs, device_type, num_gpus, use_fp8, tp_size=1):
+def get_groupedgemm_decode_perf(
+    config, target_bs, device_type, num_gpus, use_fp8, tp_size=1
+):
+    """Return the best matching decode MoE benchmark row.
+
+    Historical rows contain independently measured up/down GEMM MFUs.  New
+    MXFP4 rows contain one production-equivalent fused gate/up/SwiGLU/down
+    timing.  For those rows ``total_latency_s`` is authoritative: converting
+    latency to an MFU and then back through a caller-selected FP16/FP8 peak is
+    both lossy and incorrect for a W4A16 kernel.
+    """
     gpu = gpu_map[device_type]
     file_name = f"bench_data/grouped_gemm/decode/{device_type.lower()}/data.csv"
     if not os.path.exists(file_name):
         print(f"warning: {file_name} not exists")
-        return gpu.mfu, gpu.mfu
+        return {
+            "up_mfu": gpu.mfu,
+            "down_mfu": gpu.mfu,
+            "total_mfu": None,
+            "total_latency_s": None,
+            "kernel_kind": "",
+            "backend": "",
+            "activation_dtype": "",
+            "weight_dtype": "",
+            "execution_mode": "",
+            "source": "default",
+        }
 
-    # row: num_experts,num_gpus,num_local_experts,topk,hidden_size,intermediate_size,batch_size_per_gpu,tokens_per_expert,up_proj_us,up_mfu,down_proj_us,down_mfu
+    # The first 12 columns are the historical schema.  Optional columns after
+    # that describe a fused operator and are consumed by name.
     ep_size = num_gpus // tp_size
     expected_num_local_experts = config.num_routed_experts // ep_size
     rows = list()
-    with open(file_name, "r") as f:
-        reader = csv.reader(f)
-        next(reader)
+    with open(file_name, newline="") as f:
+        reader = csv.DictReader(f)
         for row in reader:
-            if int(row[0]) != config.num_routed_experts:
+            if int(row["num_experts"]) != config.num_routed_experts:
                 continue
-            if int(row[1]) != num_gpus:
+            if int(row["num_gpus"]) != num_gpus:
                 continue
-            if int(row[2]) != expected_num_local_experts:
+            if int(row["num_local_experts"]) != expected_num_local_experts:
                 continue
-            if int(row[3]) != config.num_experts_per_tok:
+            if int(row["topk"]) != config.num_experts_per_tok:
                 continue
-            if int(row[4]) != config.hidden_size:
+            if int(row["hidden_size"]) != config.hidden_size:
                 continue
-            if int(row[5]) != config.intermediate_size // tp_size:
+            if int(row["intermediate_size"]) != config.intermediate_size // tp_size:
                 continue
             rows.append(row)
 
     if len(rows) == 0:
         print("Warning: grouped_gemm decode mfu not found, will use default mfu.")
-        return gpu.mfu, gpu.mfu
+        return {
+            "up_mfu": gpu.mfu,
+            "down_mfu": gpu.mfu,
+            "total_mfu": None,
+            "total_latency_s": None,
+            "kernel_kind": "",
+            "backend": "",
+            "activation_dtype": "",
+            "weight_dtype": "",
+            "execution_mode": "",
+            "source": "default",
+        }
 
-    closest_row = min(rows, key=lambda r: abs(int(r[6]) - target_bs))
-    mfu1 = float(closest_row[9])
-    mfu2 = float(closest_row[11])
+    expert_dtype = str(getattr(config, "expert_dtype", "")).lower()
+    if expert_dtype in {"fp4", "mxfp4", "nvfp4"}:
+        production_rows = [
+            row
+            for row in rows
+            if row.get("backend") == "flashinfer_mxfp4_sm90"
+            and row.get("weight_dtype") == "mxfp4_e2m1"
+            and row.get("execution_mode") == "graph"
+            and (not row.get("tp_size") or int(row["tp_size"]) == tp_size)
+            and (not row.get("ep_size") or int(row["ep_size"]) == ep_size)
+        ]
+        if production_rows:
+            rows = production_rows
 
-    return round(mfu1, 6), round(mfu2, 6)
+    closest_row = min(
+        rows, key=lambda row: abs(int(row["batch_size_per_gpu"]) - target_bs)
+    )
+    total_latency_us = closest_row.get("total_latency_us", "").strip()
+    total_mfu = closest_row.get("total_mfu", "").strip()
+    result = {
+        "up_mfu": round(float(closest_row["up_mfu"]), 6),
+        "down_mfu": round(float(closest_row["down_mfu"]), 6),
+        "total_mfu": round(float(total_mfu), 6) if total_mfu else None,
+        "total_latency_s": (
+            float(total_latency_us) / 1e6 if total_latency_us else None
+        ),
+        "kernel_kind": closest_row.get("kernel_kind", ""),
+        "backend": closest_row.get("backend", ""),
+        "activation_dtype": closest_row.get("activation_dtype", ""),
+        "weight_dtype": closest_row.get("weight_dtype", ""),
+        "execution_mode": closest_row.get("execution_mode", ""),
+        "source": file_name,
+    }
+    return result
+
+
+def get_groupedgemm_decode_mfu(
+    config, target_bs, device_type, num_gpus, use_fp8, tp_size=1
+):
+    """Compatibility wrapper for callers that only understand legacy MFUs."""
+    perf = get_groupedgemm_decode_perf(
+        config, target_bs, device_type, num_gpus, use_fp8, tp_size
+    )
+
+    return perf["up_mfu"], perf["down_mfu"]
 
 def get_groupedgemm_prefill_mfu(config, seq_len, device_type, num_gpus, use_fp8, tp_size=1):
     gpu = gpu_map[device_type]
