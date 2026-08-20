@@ -9,6 +9,7 @@ from pathlib import Path
 
 from run_dsv4_real_moe_lookup import (
     build_lookup_row,
+    capture_happened_after_server_ready,
     grouped_gemm_durations,
     parse_int_list,
     summarize_pairs,
@@ -17,6 +18,32 @@ from run_dsv4_real_moe_lookup import (
 
 
 class RealMoeLookupTest(unittest.TestCase):
+    def test_rejects_capture_that_precedes_server_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            point = Path(directory)
+            (point / "server.log").write_text(
+                "SGL_MOE_CAPTURE_COMPLETE\nApplication startup complete\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(capture_happened_after_server_ready(point, {}))
+
+    def test_accepts_legacy_capture_after_server_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            point = Path(directory)
+            (point / "server.log").write_text(
+                "Application startup complete\nSGL_MOE_CAPTURE_COMPLETE\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(capture_happened_after_server_ready(point, {}))
+
+    def test_explicit_arm_metadata_is_authoritative(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertTrue(
+                capture_happened_after_server_ready(
+                    Path(directory), {"armed_after_server_ready": True}
+                )
+            )
+
     @mock.patch("run_dsv4_real_moe_lookup.os.killpg", create=True)
     def test_cleanup_signals_group_even_after_nsys_leader_exited(self, killpg):
         process = mock.Mock()

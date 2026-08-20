@@ -268,6 +268,25 @@ def build_lookup_row(
     }
 
 
+def capture_happened_after_server_ready(point_dir: Path, metadata: dict) -> bool:
+    if metadata.get("armed_after_server_ready") is True:
+        return True
+    # Backward-compatible validation for captures produced before the explicit
+    # arm-file protocol existed.  Preserve valid BS16/24/26 points while
+    # rejecting a BS32 startup-warmup capture.
+    server_log = point_dir / "server.log"
+    if not server_log.is_file():
+        return False
+    text = server_log.read_text(encoding="utf-8", errors="replace")
+    capture_at = text.find("SGL_MOE_CAPTURE_COMPLETE")
+    ready_at = max(
+        text.find("Uvicorn running on"),
+        text.find("The server is fired up and ready to roll"),
+        text.find("Application startup complete"),
+    )
+    return ready_at >= 0 and capture_at > ready_at
+
+
 def write_csv(path: Path, rows: Iterable[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=MOE_FIELDS, lineterminator="\n")
@@ -281,10 +300,14 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
     server_log_path = point_dir / "server.log"
     bench_log_path = point_dir / "bench.log"
     capture_metadata = point_dir / "capture_complete.json"
+    capture_failed = point_dir / "capture_failed.json"
+    arm_file = point_dir / "capture.armed"
 
     if args.resume and capture_metadata.is_file():
         metadata = json.loads(capture_metadata.read_text(encoding="utf-8"))
-        if metadata.get("status") == "complete":
+        if metadata.get("status") == "complete" and capture_happened_after_server_ready(
+            point_dir, metadata
+        ):
             print(f"Reusing completed real capture for BS={batch_size}", flush=True)
             report = ensure_report(
                 point_dir, prefix, args.importer, args.import_lib_dir
@@ -307,6 +330,13 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
                 topk=args.topk,
                 tp_size=args.tp_size,
             )
+        print(
+            f"Discarding pre-readiness or incomplete capture for BS={batch_size}",
+            flush=True,
+        )
+
+    for stale in (capture_metadata, capture_failed, arm_file):
+        stale.unlink(missing_ok=True)
 
     environment = os.environ.copy()
     hook_dir = Path(__file__).resolve().parent / "sglang_moe_capture"
@@ -321,6 +351,7 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
             "SGL_MOE_CAPTURE_WARMUP": str(args.replay_warmup),
             "SGL_MOE_CAPTURE_REPEATS": str(args.replay_repeats),
             "SGL_MOE_CAPTURE_DIR": str(point_dir),
+            "SGL_MOE_CAPTURE_ARM_FILE": str(arm_file),
             "SGL_MOE_CAPTURE_SAVE_TENSORS": "1" if args.save_tensors else "0",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
@@ -385,6 +416,7 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
     bench: subprocess.Popen | None = None
     try:
         wait_ready(args.port, args.server_ready_timeout, server)
+        arm_file.write_text("ready\n", encoding="utf-8")
         benchmark_command = [
             str(args.python),
             "-m",

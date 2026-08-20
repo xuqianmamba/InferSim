@@ -42,6 +42,8 @@ if _enabled("SGL_MOE_CAPTURE"):
     _output_dir = Path(
         os.environ.get("SGL_MOE_CAPTURE_DIR", "/tmp/sglang_moe_capture")
     )
+    _arm_file_value = os.environ.get("SGL_MOE_CAPTURE_ARM_FILE", "").strip()
+    _arm_file = Path(_arm_file_value) if _arm_file_value else None
 
     def _clone_runtime_call(kwargs: dict) -> dict:
         replay = dict(kwargs)
@@ -91,6 +93,7 @@ if _enabled("SGL_MOE_CAPTURE"):
                     "tp_rank": _target_tp_rank,
                     "device": torch.cuda.current_device(),
                     "execution": "isolated_real_sglang_moe_replay",
+                    "armed_after_server_ready": _arm_file is not None,
                 }
             )
             if _enabled("SGL_MOE_CAPTURE_SAVE_TENSORS", "1"):
@@ -147,6 +150,12 @@ if _enabled("SGL_MOE_CAPTURE"):
         global _captured_calls
         result = _original_cutlass_fused_moe(*args, **kwargs)
         if _capture_complete or args:
+            return result
+        # SGLang performs shape warmups during server initialization.  In
+        # particular BS32 can invoke the production fused-MoE entrypoint before
+        # HTTP readiness.  The driver creates this file only after /v1/models
+        # returns 200, preventing startup warmups from contaminating lookup data.
+        if _arm_file is not None and not _arm_file.is_file():
             return result
         input_tensor = kwargs.get("input")
         if input_tensor is None or input_tensor.shape[0] != _target_bs:
