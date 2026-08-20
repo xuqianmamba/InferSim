@@ -405,6 +405,8 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
             str(batch_size),
             "--max-concurrency",
             str(batch_size),
+            "--warmup-requests",
+            "0",
             "--host",
             "127.0.0.1",
             "--port",
@@ -415,7 +417,6 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
             str(args.model),
             "--seed",
             "5678",
-            "--flush-cache",
             "--output-file",
             str(point_dir / "bench.jsonl"),
         ]
