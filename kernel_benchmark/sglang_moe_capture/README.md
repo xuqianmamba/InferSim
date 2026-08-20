@@ -13,3 +13,41 @@ finalization kernels are not part of the grouped-GEMM lookup value.
 This hook is for a server started with `--disable-cuda-graph`. The isolated
 replay itself is bounded by `cudaProfilerStart/Stop`, so Nsys does not record
 model prefill or ordinary decode execution.
+
+## Automated lookup generation
+
+`run_dsv4_real_moe_lookup.py` performs the complete production-calibration
+workflow for one or more running batch sizes:
+
+1. starts a TP8DP1 SGLang server under Nsys;
+2. submits a fixed-size 40K -> 1K batch;
+3. captures one real 61-layer decode step and replays it ten times;
+4. imports Qdstrm when Nsys cannot finalize a report itself;
+5. validates exactly two CUTLASS grouped-GEMM kernels per layer/replay;
+6. writes `groupedgemm-decode-dsv4-tp8dp1.csv` and optionally installs it.
+
+The top-level driver is meant to run under `screen`; it does not create nested
+screen sessions. Completed per-BS points are reused by default, so an
+interrupted multi-point run can be resumed with the same output directory.
+
+Example for the H20 environment used by the DSV4-Pro calibration:
+
+```bash
+python=/home/logs/kaiying/pydeps/sglang-v0.5.17-pr31700/bin/python
+repo=/home/logs/kaiying/workspaces/InferSim-dsv4-h20
+model=/home/logs/kaiying/models/DeepSeek-V4-Pro
+dataset=/home/logs/kaiying/llm-bench-serving-pr-260810_162701/ShareGPT_V3_unfiltered_cleaned_split.json
+
+"$python" -u "$repo/kernel_benchmark/run_dsv4_real_moe_lookup.py" \
+  --python "$python" \
+  --model "$model" \
+  --dataset "$dataset" \
+  --output-dir /home/logs/kaiying/runs/dsv4_real_moe_lookup \
+  --batch-sizes 16,24,26,32 \
+  --install
+```
+
+Rows produced by this workflow are tagged
+`cutlass_grouped_gemm_pair_production_nsys_graph` and
+`production_sglang_dsv4`. They must not be confused with synthetic-routing or
+bootstrap-extrapolated measurements.
