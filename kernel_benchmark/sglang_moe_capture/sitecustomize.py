@@ -84,31 +84,14 @@ if _enabled("SGL_MOE_CAPTURE"):
         _capture_complete = True
         _output_dir.mkdir(parents=True, exist_ok=True)
         try:
-            torch.cuda.synchronize()
-            for _ in range(_warmup_replays):
-                for replay_kwargs in _captured_calls:
-                    _original_cutlass_fused_moe(**replay_kwargs)
-            torch.cuda.synchronize()
-
-            cudart = torch.cuda.cudart()
-            cudart.cudaProfilerStart()
-            for _ in range(_formal_replays):
-                for replay_kwargs in _captured_calls:
-                    _original_cutlass_fused_moe(**replay_kwargs)
-            torch.cuda.synchronize()
-            cudart.cudaProfilerStop()
-
             metadata = _routing_summary(_captured_calls)
             metadata.update(
                 {
-                    "status": "complete",
+                    "status": "armed",
                     "tp_rank": _target_tp_rank,
                     "device": torch.cuda.current_device(),
                     "execution": "isolated_real_sglang_moe_replay",
                 }
-            )
-            (_output_dir / "capture_complete.json").write_text(
-                json.dumps(metadata, indent=2), encoding="utf-8"
             )
             if _enabled("SGL_MOE_CAPTURE_SAVE_TENSORS", "1"):
                 torch.save(
@@ -122,6 +105,22 @@ if _enabled("SGL_MOE_CAPTURE"):
                     ],
                     _output_dir / "runtime_inputs.pt",
                 )
+            torch.cuda.synchronize()
+            for _ in range(_warmup_replays):
+                for replay_kwargs in _captured_calls:
+                    _original_cutlass_fused_moe(**replay_kwargs)
+            torch.cuda.synchronize()
+
+            cudart = torch.cuda.cudart()
+            cudart.cudaProfilerStart()
+            for _ in range(_formal_replays):
+                for replay_kwargs in _captured_calls:
+                    _original_cutlass_fused_moe(**replay_kwargs)
+            torch.cuda.synchronize()
+            metadata["status"] = "complete"
+            (_output_dir / "capture_complete.json").write_text(
+                json.dumps(metadata, indent=2), encoding="utf-8"
+            )
             print(
                 "SGL_MOE_CAPTURE_COMPLETE "
                 f"calls={len(_captured_calls)} repeats={_formal_replays} "
@@ -129,6 +128,9 @@ if _enabled("SGL_MOE_CAPTURE"):
                 f"dir={_output_dir}",
                 flush=True,
             )
+            # Keep this last: Nsys stop-shutdown may terminate the launched
+            # process tree as soon as cudaProfilerStop is observed.
+            cudart.cudaProfilerStop()
         except Exception as error:
             failure = {
                 "status": "failed",
