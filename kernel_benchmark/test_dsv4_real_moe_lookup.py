@@ -17,7 +17,7 @@ from run_dsv4_real_moe_lookup import (
 
 
 class RealMoeLookupTest(unittest.TestCase):
-    @mock.patch("run_dsv4_real_moe_lookup.os.killpg")
+    @mock.patch("run_dsv4_real_moe_lookup.os.killpg", create=True)
     def test_cleanup_signals_group_even_after_nsys_leader_exited(self, killpg):
         process = mock.Mock()
         process.pid = 1234
