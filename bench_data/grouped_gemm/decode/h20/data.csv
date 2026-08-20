@@ -265,4 +265,7 @@ num_experts,num_gpus,num_local_experts,topk,hidden_size,intermediate_size,batch_
 512,8,64,10,2048,512,256,40,93.087,0.383,56.294,0.32,,,,,,,,,,,,,,,
 512,8,64,10,2048,512,512,80,167.322,0.438,93.463,0.374,,,,,,,,,,,,,,,
 512,8,64,10,2048,512,1024,160,292.264,0.494,140.759,0.505,,,,,,,,,,,,,,,
-384,8,384,6,7168,384,16,0,147.767,0.04833,131.826,0.027087,279.593,0.038315,cutlass_grouped_gemm_pair_production_nsys_graph,flashinfer_mxfp4_sm90,bf16,mxfp4_e2m1,148.0,8,1,16,graph,,,production_sglang_dsv4,10.0
+384,8,384,6,7168,384,16,0,141.687,0.050404,126.484,0.028231,268.171,0.039946,cutlass_grouped_gemm_pair_production_nsys_graph,flashinfer_mxfp4_sm90,bf16,mxfp4_e2m1,148.0,8,1,16,graph,,,production_sglang_dsv4,10.0
+384,8,384,6,7168,384,24,0,185.393,0.057783,170.161,0.031477,355.554,0.045193,cutlass_grouped_gemm_pair_production_nsys_graph,flashinfer_mxfp4_sm90,bf16,mxfp4_e2m1,148.0,8,1,32,graph,,,production_sglang_dsv4,10.0
+384,8,384,6,7168,384,26,0,188.421,0.061592,172.144,0.033708,360.565,0.048279,cutlass_grouped_gemm_pair_production_nsys_graph,flashinfer_mxfp4_sm90,bf16,mxfp4_e2m1,148.0,8,1,32,graph,,,production_sglang_dsv4,10.0
+384,8,384,6,7168,384,32,0,216.053,0.066110,198.261,0.036021,414.314,0.051712,cutlass_grouped_gemm_pair_production_nsys_graph,flashinfer_mxfp4_sm90,bf16,mxfp4_e2m1,148.0,8,1,32,graph,,,production_sglang_dsv4,10.0

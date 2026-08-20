@@ -223,6 +223,43 @@ class DSV4SimulatorTest(unittest.TestCase):
             "cutlass_grouped_gemm_pair_production_nsys_graph",
         )
 
+    def test_checked_in_production_moe_lookup_has_all_calibrated_batches(self):
+        expected = {
+            16: (141.687, 126.484, 268.171),
+            24: (185.393, 170.161, 355.554),
+            26: (188.421, 172.144, 360.565),
+            32: (216.053, 198.261, 414.314),
+        }
+        with contextlib.chdir(ROOT):
+            for batch_size, (up_us, down_us, total_us) in expected.items():
+                row = read_csv_row(
+                    ROOT / "bench_data/grouped_gemm/decode/h20/data.csv",
+                    num_experts=384,
+                    num_gpus=8,
+                    num_local_experts=384,
+                    topk=6,
+                    hidden_size=7168,
+                    intermediate_size=384,
+                    batch_size_per_gpu=batch_size,
+                    kernel_kind="cutlass_grouped_gemm_pair_production_nsys_graph",
+                    routing_mode="production_sglang_dsv4",
+                )
+                self.assertAlmostEqual(float(row["up_proj_us"]), up_us, places=3)
+                self.assertAlmostEqual(float(row["down_proj_us"]), down_us, places=3)
+                self.assertAlmostEqual(
+                    float(row["total_latency_us"]), total_us, places=3
+                )
+                perf = get_groupedgemm_decode_perf(
+                    self.config, batch_size, "H20", 8, False, 8
+                )
+                self.assertAlmostEqual(
+                    perf["total_latency_s"] * 1e6, total_us, places=3
+                )
+                self.assertEqual(
+                    perf["kernel_kind"],
+                    "cutlass_grouped_gemm_pair_production_nsys_graph",
+                )
+
     def test_mxfp4_grouped_gemm_latency_includes_its_weight_loading(self):
         perf = {
             "up_mfu": 0.033,

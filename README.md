@@ -22,7 +22,8 @@ The accuracy of simulation results relies heavily on the kernel benchmark result
 ## Supported Features
 
 - **Attention**: MHA/GQA, MLA, DeepSeek-V4 DSA. Benchmarked on FlashInfer, FlashAttention-3, FlashMLA.
-- **MoE**: GroupedGEMM. Benchmarked on DeepGEMM.
+- **MoE**: GroupedGEMM. Benchmarked on DeepGEMM, with production SGLang/Nsys
+  calibration for DeepSeek-V4-Pro MXFP4 MoE on H20.
 - **Linear**: GEMM. Benchmarked on DeepGEMM.
 - **Parallelization**: DP Attn, EP MoE.
 - **Large EP**: DeepEP dispatch and combine, with normal and low_latency mode.
@@ -94,13 +95,37 @@ optional arguments:
 
 ## Example
 
-DeepSeek-V4-Pro DSA decode uses measured H20 sparse-attention and indexer
-lookup tables. The remaining projection and MoE terms use InferSim's existing
-generic models.
+DeepSeek-V4-Pro TP8DP1 decode on H20 uses measured sparse-attention and indexer
+lookup tables. Its routed MXFP4 MoE lookup also contains production SGLang
+measurements for running batch sizes 16, 24, 26, and 32. These rows replay the
+real hidden states, routing decisions, checkpoint weights, TP/EP arguments,
+and tuning bucket captured from SGLang, while Nsys measures only the gate/up
+and down CUTLASS grouped GEMMs. InferSim uses an exact batch-size match when it
+exists and the nearest calibrated batch otherwise.
 
 ```bash
 bash example/deepseek-v4-pro/decode_h20_tp8.sh /path/to/config.json
 ```
+
+For BS16, ISL 40960, OSL 1000, and FP8 KV cache, the final H20 calibration run
+with the refreshed DSA tables reported the following simulated result:
+
+| Metric | Result |
+| --- | ---: |
+| DSA all-layer core latency | 4921.25 us |
+| Routed MoE grouped-GEMM latency per layer | 268.17 us |
+| Analytical layer latency | 483.71 us |
+| TPOT, including the default 5 ms scheduler overhead | 34.51 ms |
+| Throughput | 58 tok/GPU/s |
+
+These are simulator estimates, not an end-to-end serving benchmark. Pass
+`--decode-scheduler-overhead-ms 0` to inspect the kernel/communication model
+without the default 5 ms scheduler allowance; this configuration is about
+29.51 ms TPOT and 68 tok/GPU/s.
+
+The checked-in MoE lookup is immediately usable and does not require SGLang,
+Nsys, a GPU, or recompilation. To regenerate it from a real SGLang run, use the
+[automated production MoE calibration workflow](./kernel_benchmark/sglang_moe_capture/README.md).
 
 Standalone kernel benchmarks describe isolated execution. They can overstate
 runtime TPOT when the serving engine fuses or overlaps work. If complete C4 and
