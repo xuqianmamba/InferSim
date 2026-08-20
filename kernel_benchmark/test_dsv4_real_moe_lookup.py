@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import signal
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from run_dsv4_real_moe_lookup import (
@@ -10,10 +12,19 @@ from run_dsv4_real_moe_lookup import (
     grouped_gemm_durations,
     parse_int_list,
     summarize_pairs,
+    terminate_process_group,
 )
 
 
 class RealMoeLookupTest(unittest.TestCase):
+    @mock.patch("run_dsv4_real_moe_lookup.os.killpg")
+    def test_cleanup_signals_group_even_after_nsys_leader_exited(self, killpg):
+        process = mock.Mock()
+        process.pid = 1234
+        process.poll.return_value = 0
+        terminate_process_group(process)
+        killpg.assert_called_once_with(1234, signal.SIGTERM)
+
     def test_parse_int_list(self):
         self.assertEqual(parse_int_list("16,24, 32"), [16, 24, 32])
         with self.assertRaises(Exception):

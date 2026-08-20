@@ -80,11 +80,14 @@ def wait_ready(port: int, timeout: float, process: subprocess.Popen) -> None:
 
 
 def terminate_process_group(process: subprocess.Popen, timeout: float = 30) -> None:
-    if process.poll() is not None:
-        return
+    # Nsys may exit before every process it launched.  The process-group
+    # leader can therefore be gone while SGLang workers still own the port.
+    # Always signal the group created by start_new_session=True.
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
+        pass
+    if process.poll() is not None:
         return
     try:
         process.wait(timeout=timeout)
@@ -105,6 +108,17 @@ def ensure_port_available(port: int) -> None:
             raise RuntimeError(
                 f"port {port} is already serving a process; stop it before this run"
             )
+
+
+def wait_port_available(port: int, timeout: float = 60) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            ensure_port_available(port)
+            return
+        except RuntimeError:
+            time.sleep(1)
+    ensure_port_available(port)
 
 
 def ensure_report(
@@ -441,8 +455,8 @@ def capture_point(args: argparse.Namespace, batch_size: int, point_dir: Path) ->
     finally:
         if bench is not None and bench.poll() is None:
             terminate_process_group(bench, timeout=10)
-        if server.poll() is None:
-            terminate_process_group(server, timeout=30)
+        terminate_process_group(server, timeout=30)
+        wait_port_available(args.port, timeout=60)
         server_log.close()
         if "bench_log" in locals():
             bench_log.close()
