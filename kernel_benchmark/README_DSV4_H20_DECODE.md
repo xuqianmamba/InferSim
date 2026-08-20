@@ -56,6 +56,14 @@ Nsys production trace shows materially different routing skew, replaying
 captured routing tensors is the next calibration step; do not compensate by
 manually fitting the reported latency.
 
+For TP8DP1 at decode BS16, the installed H20 lookup contains a production
+calibration extracted from a real SGLang CUDA Graph Nsys trace (40,960-token
+context): gate/up `147.767 us`, down `131.826 us`, total `279.593 us`. The
+trace contains 610 pairs, exactly 10 decode steps x 61 layers. At the same
+batch size this trusted production row takes precedence over synthetic eager
+rows; batch-size distance remains the primary lookup key, so it does not mask
+an exact measurement for another batch size.
+
 The attention CSV `kv_len` is the original full-context length. The logits
 compatibility CSV `s_kv` is the C4-compressed length actually seen by the
 DeepGEMM kernel.
@@ -96,9 +104,12 @@ The runner exits nonzero if a kernel fails or an expected CSV/row is missing.
 With `--install`, validation finishes before any lookup data is replaced. The
 runner overwrites H20 DSA files and replaces only matching DSV4 TP8DP1 rows in
 `bench_data/grouped_gemm/decode/h20/data.csv`; unrelated rows are preserved.
-Only eager single-kernel results may be installed. The benchmark still passes
-the production TP/EP topology and tuning bucket to FlashInfer; graph launch
-overhead and other fused-MoE kernels do not belong in this lookup table.
+Only eager single-kernel results may be installed by this microbenchmark
+runner. A separately validated production Nsys row may use graph mode because
+its value is still the sum of only the two grouped-GEMM kernel durations, not
+the full graph span. The benchmark still passes the production TP/EP topology
+and tuning bucket to FlashInfer; graph launch overhead and other fused-MoE
+kernels do not belong in this lookup table.
 
 To refresh only the MoE grouped-GEMM table, without rerunning attention and
 indexer benchmarks:

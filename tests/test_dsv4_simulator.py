@@ -153,6 +153,76 @@ class DSV4SimulatorTest(unittest.TestCase):
         self.assertEqual(bf16["total_latency_s"], fp8_flag["total_latency_s"])
         self.assertEqual(bf16["weight_dtype"], "mxfp4_e2m1")
 
+    def test_production_nsys_graph_row_wins_at_the_same_batch_size(self):
+        fields = (
+            "num_experts,num_gpus,num_local_experts,topk,hidden_size,"
+            "intermediate_size,batch_size_per_gpu,tokens_per_expert,"
+            "up_proj_us,up_mfu,down_proj_us,down_mfu,total_latency_us,"
+            "total_mfu,kernel_kind,backend,activation_dtype,weight_dtype,"
+            "mfu_peak_tflops,tp_size,ep_size,tune_max_num_tokens,"
+            "execution_mode,active_experts,max_tokens_per_expert,"
+            "routing_mode,swiglu_limit"
+        ).split(",")
+        base = dict.fromkeys(fields, "")
+        base.update(
+            num_experts=384,
+            num_gpus=8,
+            num_local_experts=384,
+            topk=6,
+            hidden_size=7168,
+            intermediate_size=384,
+            batch_size_per_gpu=16,
+            tokens_per_expert=0,
+            backend="flashinfer_mxfp4_sm90",
+            activation_dtype="bf16",
+            weight_dtype="mxfp4_e2m1",
+            tp_size=8,
+            ep_size=1,
+            tune_max_num_tokens=16,
+        )
+        eager = dict(base)
+        eager.update(
+            up_proj_us=230.273,
+            up_mfu=0.031,
+            down_proj_us=195.873,
+            down_mfu=0.018,
+            total_latency_us=426.146,
+            total_mfu=0.025,
+            kernel_kind="cutlass_grouped_gemm_pair_pure_ffi",
+            execution_mode="eager",
+        )
+        production = dict(base)
+        production.update(
+            up_proj_us=147.767,
+            up_mfu=0.04833,
+            down_proj_us=131.826,
+            down_mfu=0.027087,
+            total_latency_us=279.593,
+            total_mfu=0.038315,
+            kernel_kind="cutlass_grouped_gemm_pair_production_nsys_graph",
+            execution_mode="graph",
+            routing_mode="production_sglang_dsv4",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "bench_data/grouped_gemm/decode/h20/data.csv"
+            path.parent.mkdir(parents=True)
+            with path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow(eager)
+                writer.writerow(production)
+            with contextlib.chdir(root):
+                result = get_groupedgemm_decode_perf(
+                    self.config, 16, "H20", 8, False, 8
+                )
+        self.assertAlmostEqual(result["total_latency_s"] * 1e6, 279.593)
+        self.assertEqual(result["execution_mode"], "graph")
+        self.assertEqual(
+            result["kernel_kind"],
+            "cutlass_grouped_gemm_pair_production_nsys_graph",
+        )
+
     def test_mxfp4_grouped_gemm_latency_includes_its_weight_loading(self):
         perf = {
             "up_mfu": 0.033,

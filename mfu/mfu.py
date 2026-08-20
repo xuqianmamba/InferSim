@@ -284,15 +284,34 @@ def get_groupedgemm_decode_perf(
             for row in rows
             if row.get("backend") == "flashinfer_mxfp4_sm90"
             and row.get("weight_dtype") == "mxfp4_e2m1"
-            and row.get("execution_mode") == "eager"
+            and row.get("execution_mode") in {"eager", "graph"}
             and (not row.get("tp_size") or int(row["tp_size"]) == tp_size)
             and (not row.get("ep_size") or int(row["ep_size"]) == ep_size)
         ]
         if production_rows:
             rows = production_rows
 
+    # Keep batch-size proximity authoritative.  At the same batch size, prefer
+    # a grouped-GEMM pair extracted from a real SGLang production Nsys trace,
+    # then a standalone eager measurement, and finally any other graph row.
+    # This prevents a BS16 production calibration from masking an exact BS24
+    # measurement while still replacing synthetic BS16 data when both exist.
+    def row_priority(row):
+        is_production_nsys = (
+            row.get("kernel_kind")
+            == "cutlass_grouped_gemm_pair_production_nsys_graph"
+        )
+        execution_mode = row.get("execution_mode")
+        source_priority = (
+            0 if is_production_nsys else 1 if execution_mode == "eager" else 2
+        )
+        return (
+            abs(int(row["batch_size_per_gpu"]) - target_bs),
+            source_priority,
+        )
+
     closest_row = min(
-        rows, key=lambda row: abs(int(row["batch_size_per_gpu"]) - target_bs)
+        rows, key=row_priority
     )
     total_latency_us = closest_row.get("total_latency_us", "").strip()
     total_mfu = closest_row.get("total_mfu", "").strip()
